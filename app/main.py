@@ -1,5 +1,5 @@
 # Bluecroft Finance — Complete app/main.py wired to robust metrics module
-# - Uses app.metrics.compute_lending_metrics for all calculated metrics
+# - Uses app.metrics.compute_lending_metrics for all computed metrics
 # - Displays parsed input audit to explain missing/suspicious inputs
 # - Stacked, single-column report layout to avoid layout float issues
 # - Shows both amortising and interest-only bridging payments and DSCRs
@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import glob
 import io
+import json
 import typing
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -52,7 +53,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Lazy imports for pipeline and LLM (non-blocking)
+# Lazy imports for pipeline and summariser (non-blocking)
 def load_pipeline() -> typing.Tuple[typing.Optional[typing.Callable], typing.Optional[typing.Callable]]:
     try:
         from pipeline.pipeline import process_pdf, process_data  # type: ignore
@@ -67,7 +68,6 @@ def load_summarizer() -> typing.Tuple[typing.Callable, typing.Callable]:
         return generate_summary, answer_question
     except Exception as e:
         print("SUMMARIZER IMPORT ERROR:", e)
-        # fallback simple implementations
         def fallback_summary(parsed: dict) -> str:
             lm = parsed.get("lending_metrics", {}) or {}
             return f"Borrower: {parsed.get('borrower','Unknown')}. LTV: {lm.get('ltv','N/A')}, Risk: {lm.get('risk_category','N/A')}"
@@ -75,7 +75,7 @@ def load_summarizer() -> typing.Tuple[typing.Callable, typing.Callable]:
             return "LLM not available. Please set OPENAI_API_KEY for richer answers."
         return fallback_summary, fallback_answer
 
-# Utility to center charts inside the report-box using middle column
+# Helper: center charts in a column middle
 def center_chart(chart_obj, use_container_width: bool = True, height: int | None = None):
     try:
         cols = st.columns([1, 10, 1])
@@ -276,7 +276,7 @@ if st.button("Analyse With AI"):
     if tmp_parsed:
         parsed = tmp_parsed.copy()
         # ensure standard keys are present
-        if "loan_amount" not in parsed and parsed.get("loan_amount") is None and parsed.get("loan"):
+        if "loan_amount" not in parsed and parsed.get("loan") is not None:
             parsed["loan_amount"] = parsed.get("loan")
     elif tmp_file:
         if proc_pdf is None:
@@ -290,6 +290,40 @@ if st.button("Analyse With AI"):
 
     # Diagnostic: show raw parsed input to help debug bad parsing
     st.markdown("### Raw parsed input (diagnostic)")
+    st.write(parsed)
+
+    # Safe normalisation of common problematic fields (commas, currency symbols, strings)
+    def _norm_quiet(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return v
+        s = str(v).strip()
+        if s == "":
+            return None
+        s = s.replace(",", "").replace("£", "").replace("$", "")
+        try:
+            return float(s)
+        except Exception:
+            return s
+
+    if parsed.get("loan_amount") is None and parsed.get("loan") is not None:
+        parsed["loan_amount"] = _norm_quiet(parsed.get("loan"))
+    parsed["loan_amount"] = _norm_quiet(parsed.get("loan_amount"))
+    parsed["property_value"] = _norm_quiet(parsed.get("property_value") or parsed.get("property_value_estimate") or parsed.get("property"))
+    # interest rate: allow percent like 5.5 or decimal 0.055
+    rate_raw = parsed.get("interest_rate_annual") or parsed.get("interest_rate") or parsed.get("rate")
+    parsed["interest_rate_annual"] = _norm_quiet(rate_raw)
+    term_raw = parsed.get("term_months") or parsed.get("term")
+    if term_raw is not None:
+        try:
+            parsed["term_months"] = int(term_raw)
+        except Exception:
+            parsed["term_months"] = None
+    parsed["income"] = _norm_quiet(parsed.get("income") or parsed.get("annual_income"))
+
+    # Diagnostic after normalisation
+    st.markdown("### Normalised parsed input (diagnostic)")
     st.write(parsed)
 
     # Compute lending metrics (robust)
@@ -349,11 +383,11 @@ if st.button("Analyse With AI"):
     # Amortization visuals if available; center in report box
     st.markdown("### Amortization & monthly breakdown")
     try:
-        # if amortization_preview_rows present use it, otherwise try to build full schedule
+        df_am = None
         amort_preview = lm.get("amortization_preview_rows")
         if amort_preview:
             df_am = pd.DataFrame(amort_preview)
-            # If we only have preview rows, prefer to build full schedule when possible
+            # try to build full schedule when possible
             if parsed.get("loan_amount") and parsed.get("interest_rate_annual") and parsed.get("term_months"):
                 try:
                     rate_raw = parsed.get("interest_rate_annual")
@@ -388,7 +422,7 @@ if st.button("Analyse With AI"):
     # Payment composition, affordability and risk (stacked)
     st.markdown("### Payment composition")
     try:
-        if df_am is not None:
+        if 'df_am' in locals() and df_am is not None:
             pie_df = pd.DataFrame([{"part": "Principal", "value": df_am["principal"].sum()}, {"part": "Interest", "value": df_am["interest"].sum()}])
             center_chart(alt.Chart(pie_df).mark_arc(innerRadius=40).encode(theta=alt.Theta("value:Q"), color=alt.Color("part:N")), height=200)
         else:
@@ -440,7 +474,7 @@ if st.button("Analyse With AI"):
     try:
         buf = io.BytesIO()
         payload = {"parsed": parsed, "lending_metrics": lm}
-        buf.write(io.BytesIO(json.dumps(payload, indent=2).encode("utf-8")).getvalue())
+        buf.write(json.dumps(payload, indent=2).encode("utf-8"))
         buf.seek(0)
         st.download_button("Download report (JSON)", data=buf, file_name="underwriting_report.json", mime="application/json")
     except Exception:

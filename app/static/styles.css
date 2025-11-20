@@ -1,6 +1,7 @@
-/* Professional background + UI polish for Bluecroft Finance app */
+/* app/static/styles.css
+   Professional background + UI polish for Bluecroft Finance app
+*/
 
-/* App background: soft blue gradient with a subtle SVG noise overlay for texture */
 .stApp {
   background: linear-gradient(180deg, #eaf2ff 0%, #f9fbff 55%, #ffffff 100%);
   background-attachment: fixed;
@@ -10,7 +11,7 @@
   font-family: Inter, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
-/* Add a gentle patterned overlay using embedded SVG (light, no external images required) */
+/* Subtle patterned overlay using an embedded SVG */
 .stApp::before {
   content: "";
   position: fixed;
@@ -34,13 +35,13 @@
   filter: blur(0px);
 }
 
-/* Keep the app content above overlay */
+/* Keep content above overlay */
 .element-container, .stBlock {
   position: relative;
   z-index: 1;
 }
 
-/* Header / banner polish (subtle glass effect) */
+/* Header / banner polish */
 .bf-header {
   background: linear-gradient(90deg, rgba(0,51,102,0.92) 0%, rgba(0,120,212,0.92) 100%);
   color: white;
@@ -51,7 +52,7 @@
   backdrop-filter: blur(6px);
 }
 
-/* Card style adjustment for better contrast on patterned background */
+/* Card style */
 .bf-card {
   background: rgba(255,255,255,0.95);
   border-radius: 12px;
@@ -60,7 +61,7 @@
   border: 1px solid rgba(15,40,80,0.04);
 }
 
-/* Small helpers and text tweaks */
+/* Small helpers */
 .bf-title { font-size: 28px; font-weight: 700; margin: 0; color: #ffffff; }
 .bf-sub { font-size: 14px; margin: 0; opacity: 0.95; color: #eaf6ff; }
 .bf-small { color: #234; font-size: 13px; }

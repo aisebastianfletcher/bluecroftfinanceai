@@ -1,18 +1,25 @@
 /* app/static/styles.css
-   Professional background + UI polish for Bluecroft Finance app
+   Stronger background that targets multiple Streamlit containers and uses !important
 */
 
-.stApp {
-  background: linear-gradient(180deg, #eaf2ff 0%, #f9fbff 55%, #ffffff 100%);
-  background-attachment: fixed;
-  background-size: cover;
-  min-height: 100vh;
-  color: #0b2340;
-  font-family: Inter, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+body,
+.stApp,
+.main,
+.block-container,
+[data-testid="stAppViewContainer"],
+.reportview-container,
+.css-1outpf7 { /* extra fallback classname */
+  background: linear-gradient(180deg, #eaf2ff 0%, #f9fbff 55%, #ffffff 100%) !important;
+  background-attachment: fixed !important;
+  background-size: cover !important;
+  min-height: 100vh !important;
+  color: #0b2340 !important;
+  font-family: Inter, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
 }
 
-/* Subtle patterned overlay using an embedded SVG */
-.stApp::before {
+/* Subtle patterned overlay using embedded SVG */
+.stApp::before,
+[data-testid="stAppViewContainer"]::before {
   content: "";
   position: fixed;
   inset: 0;
@@ -28,46 +35,41 @@
       <circle cx='200' cy='120' r='120'/>\
       <circle cx='1150' cy='780' r='300'/>\
     </g>\
-  </svg>");
-  background-size: cover;
-  mix-blend-mode: normal;
-  z-index: 0;
-  filter: blur(0px);
+  </svg>") !important;
+  background-size: cover !important;
+  mix-blend-mode: normal !important;
+  z-index: 0 !important;
+  filter: blur(0px) !important;
 }
 
 /* Keep content above overlay */
-.element-container, .stBlock {
-  position: relative;
-  z-index: 1;
+.element-container, .stBlock, .main > .block-container {
+  position: relative !important;
+  z-index: 1 !important;
 }
 
 /* Header / banner polish */
 .bf-header {
-  background: linear-gradient(90deg, rgba(0,51,102,0.92) 0%, rgba(0,120,212,0.92) 100%);
-  color: white;
-  padding: 18px 24px;
-  border-radius: 10px;
-  margin-bottom: 18px;
-  box-shadow: 0 8px 22px rgba(0,30,60,0.10);
-  backdrop-filter: blur(6px);
+  background: linear-gradient(90deg, rgba(0,51,102,0.92) 0%, rgba(0,120,212,0.92) 100%) !important;
+  color: white !important;
+  padding: 18px 24px !important;
+  border-radius: 10px !important;
+  margin-bottom: 18px !important;
+  box-shadow: 0 8px 22px rgba(0,30,60,0.10) !important;
+  backdrop-filter: blur(6px) !important;
 }
 
 /* Card style */
 .bf-card {
-  background: rgba(255,255,255,0.95);
-  border-radius: 12px;
-  padding: 18px;
-  box-shadow: 0 6px 18px rgba(10,30,60,0.06);
-  border: 1px solid rgba(15,40,80,0.04);
+  background: rgba(255,255,255,0.95) !important;
+  border-radius: 12px !important;
+  padding: 18px !important;
+  box-shadow: 0 6px 18px rgba(10,30,60,0.06) !important;
+  border: 1px solid rgba(15,40,80,0.04) !important;
 }
-
-/* Small helpers */
-.bf-title { font-size: 28px; font-weight: 700; margin: 0; color: #ffffff; }
-.bf-sub { font-size: 14px; margin: 0; opacity: 0.95; color: #eaf6ff; }
-.bf-small { color: #234; font-size: 13px; }
 
 /* Responsive tweaks */
 @media (max-width: 640px) {
-  .bf-title { font-size: 22px; }
-  .bf-header { padding: 12px 14px; }
+  .bf-title { font-size: 22px !important; }
+  .bf-header { padding: 12px 14px !important; }
 }

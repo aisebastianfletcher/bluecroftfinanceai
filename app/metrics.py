@@ -248,7 +248,7 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
     lm["risk_score_computed"] = round(risk_score, 3)
     lm["risk_category"] = "High" if risk_score >= 0.7 else ("Medium" if risk_score >= 0.4 else "Low")
 
-    # Explainable reasons
+    # Reasons
     reasons: List[str] = []
     if lm.get("ltv") is not None:
         if lm["ltv"] >= 0.85:
@@ -265,7 +265,7 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("No automated flags detected")
     lm["risk_reasons"] = reasons
 
-    # Amortization preview (first 12 rows)
+    # Amortization preview
     if amort_df is not None:
         try:
             lm["amortization_preview_rows"] = amort_df.head(12).to_dict(orient="records")
@@ -277,7 +277,6 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
         lm["amortization_preview_rows"] = None
         lm["amortization_total_interest"] = None
 
-    # Attach audit and lending metrics
     parsed["input_audit"] = audit
     parsed["lending_metrics"] = lm
     return lm

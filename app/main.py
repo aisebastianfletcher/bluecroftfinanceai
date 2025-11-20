@@ -15,39 +15,89 @@ st.set_page_config(page_title="AI Lending Assistant", layout="wide")
 
 st.title("AI Lending Assistant — Bluecroft Demo")
 
-st.sidebar.header("Create borrower (form)")
-with st.sidebar.form("borrower_form"):
-    borrower_name = st.text_input("Borrower name", "John Doe")
-    income = st.number_input("Annual income (GBP)", value=85000)
-    loan_amount = st.number_input("Requested loan amount (GBP)", value=240000)
-    property_value = st.number_input("Property value (GBP)", value=330000)
-    submit_generate = st.form_submit_button("Generate PDF")
+# Use tabs to present Form vs Upload paths
+tab_form, tab_upload = st.tabs(["Fill Form (generate PDF)", "Upload PDF"])
 
-out_path = None
-if submit_generate:
-    data = {
-        "borrower": borrower_name,
-        "income": float(income),
-        "loan_amount": float(loan_amount),
-        "property_value": float(property_value),
-    }
-    out_path = create_pdf_from_dict(data)
-    st.sidebar.success(f"PDF generated: {out_path}")
+generated_pdf_path = None
+uploaded_pdf_path = None
 
-st.header("Upload or select a PDF to analyse")
-uploaded = st.file_uploader("Upload application / statement PDF", type=["pdf"])
+with tab_form:
+    st.markdown("Fill the fields below and click Generate PDF to create an application PDF.")
+    with st.form("application_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            borrower_name = st.text_input("Borrower name", "John Doe")
+            email = st.text_input("Email", "")
+            income = st.number_input("Annual income (GBP)", value=85000, step=1000)
+            loan_amount = st.number_input("Requested loan amount (GBP)", value=240000, step=1000)
+        with col2:
+            property_value = st.number_input("Property value (GBP)", value=330000, step=1000)
+            term_months = st.number_input("Loan term (months)", value=12)
+            notes = st.text_area("Notes / comments", "")
+        submit_generate = st.form_submit_button("Generate PDF")
 
-if uploaded:
-    tmp_file = save_uploaded_file(uploaded)
-    st.success(f"Saved uploaded file to {tmp_file}")
+    if submit_generate:
+        data = {
+            "borrower": borrower_name,
+            "email": email,
+            "income": float(income),
+            "loan_amount": float(loan_amount),
+            "property_value": float(property_value),
+            "term_months": int(term_months),
+            "notes": notes,
+        }
+        generated_pdf_path = create_pdf_from_dict(data)
+        st.success(f"PDF generated: {generated_pdf_path}")
+        # provide download button for convenience
+        try:
+            with open(generated_pdf_path, "rb") as f:
+                pdf_bytes = f.read()
+            st.download_button(
+                label="Download generated PDF",
+                data=pdf_bytes,
+                file_name=os.path.basename(generated_pdf_path),
+                mime="application/pdf",
+            )
+        except Exception as e:
+            st.warning(f"Couldn't offer a download (server filesystem may be restricted): {e}")
+
+with tab_upload:
+    st.markdown("Upload an existing application or statement PDF for analysis.")
+    uploaded = st.file_uploader("Upload application / statement PDF", type=["pdf"], accept_multiple_files=False, key="upload1")
+    if uploaded:
+        uploaded_pdf_path = save_uploaded_file(uploaded)
+        st.success(f"Saved uploaded file to {uploaded_pdf_path}")
+        # allow download back or quick preview action
+        try:
+            with open(uploaded_pdf_path, "rb") as f:
+                up_bytes = f.read()
+            st.download_button(
+                label="Download uploaded PDF",
+                data=up_bytes,
+                file_name=os.path.basename(uploaded_pdf_path),
+                mime="application/pdf",
+            )
+        except Exception as e:
+            st.warning(f"Couldn't offer a download (server filesystem may be restricted): {e}")
+
+# Choose which PDF to analyse (priority: uploaded -> generated -> none)
+st.markdown("---")
+st.header("Analyse a PDF with AI")
+source_choice = st.radio("Select PDF source to analyse", options=["Use uploaded PDF", "Use generated PDF"], index=0)
+
+tmp_file = None
+if source_choice == "Use uploaded PDF":
+    if uploaded_pdf_path:
+        tmp_file = uploaded_pdf_path
+    else:
+        st.warning("No PDF was uploaded. Switch to 'Use generated PDF' or upload a PDF above.")
 else:
-    tmp_file = None
-    if out_path:
-        st.info(f"You generated a PDF in this session: {out_path}. Use 'Analyse With AI' to process it.")
+    if generated_pdf_path:
+        tmp_file = generated_pdf_path
+    else:
+        st.info("No PDF was generated in this session yet. Use the 'Fill Form' tab to create one.")
 
 if st.button("Analyse With AI"):
-    if tmp_file is None and out_path:
-        tmp_file = out_path
     if tmp_file is None:
         st.error("No PDF available: please upload a PDF or generate one from the form.")
     else:

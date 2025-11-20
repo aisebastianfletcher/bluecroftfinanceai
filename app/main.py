@@ -1,8 +1,7 @@
-# Polished Bluecroft Finance UI — revised graphs layout and corrected calculations
-# - Fixes layout so charts render in balanced grid (not stacked down one side)
-# - Improves accuracy of amortization, totals, LTV/LTC, DSCR computations
-# - Uses amortization schedule when rate & term present to compute total interest and annual debt service
-# - Keeps lazy imports/fallbacks for robustness
+# Polished Bluecroft Finance UI — improved chart/grid layout and corrected calculations
+# - Fixes charts stacking issue by using a clear grid layout and containers
+# - Keeps lazy imports, lending metrics, amortization and reporting support
+# - Injects a small CSS tweak to ensure Altair charts behave responsively
 import os
 import sys
 from pathlib import Path
@@ -23,25 +22,37 @@ import altair as alt
 
 st.set_page_config(page_title="Bluecroft Finance — AI Lending Assistant", layout="wide")
 
-# Load CSS if present (silent fallback)
+# ---- small CSS tweak to keep charts from floating or collapsing ----
+# This prevents some Streamlit themes / CSS from forcing charts to sit in one column
+_sty = """
+/* Ensure Altair charts occupy their container width and display as block */
+.stAltairChart, .stChart, .stPlotlyChart, .stVegaLiteChart {
+  display: block !important;
+  width: 100% !important;
+  margin: 0 auto !important;
+}
+/* Prevent floating of chart wrappers */
+[data-testid="stAltairChart"], [data-testid="stChart"] {
+  float: none !important;
+  clear: both !important;
+}
+/* Keep the card containers above the background overlay */
+.bf-card, .bf-header {
+  position: relative;
+  z-index: 2;
+}
+"""
+st.markdown(f"<style>{_sty}</style>", unsafe_allow_html=True)
+
+# Load optional styles.css if present (non-fatal)
 _css_path = Path(__file__).parent / "static" / "styles.css"
 if _css_path.exists():
     try:
         st.markdown(_css_path.read_text(encoding="utf-8"), unsafe_allow_html=True)
     except Exception:
         pass
-else:
-    st.markdown(
-        """
-        <style>
-        .bf-header { background: linear-gradient(90deg,#003366,#0078D4); color: white; padding:12px 18px; border-radius:8px; }
-        .bf-card { background: rgba(255,255,255,0.98); padding:16px; border-radius:10px; box-shadow: 0 6px 18px rgba(10,30,60,0.06); }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
 
-# ---------- Lazy import helpers ----------
+# ----------------- Lazy import helpers -----------------
 def load_pipeline() -> typing.Tuple[typing.Optional[typing.Callable], typing.Optional[typing.Callable]]:
     try:
         from pipeline.pipeline import process_pdf, process_data  # type: ignore
@@ -56,44 +67,32 @@ def load_summarizer() -> typing.Tuple[typing.Callable, typing.Callable]:
         return generate_summary, answer_question
     except Exception as e:
         print("SUMMARIZER IMPORT ERROR:", e)
-        # fallback implementations
+        # deterministic fallbacks
         def fallback_summary(parsed: dict) -> str:
             borrower = parsed.get("borrower", "Unknown")
             income = parsed.get("income", "N/A")
             loan = parsed.get("loan_amount", "N/A")
             lm = parsed.get("lending_metrics", {}) or {}
             ltv = lm.get("ltv", "N/A")
-            risk_cat = lm.get("risk_category", "N/A")
             return (
-                f"Borrower: {borrower}\n"
-                f"Income: £{income:,}\n"
-                f"Loan: £{loan:,}\n"
-                f"LTV: {ltv}\n"
-                f"Risk category: {risk_cat}\n\n"
-                "Recommendation: Manual review recommended where metrics exceed policy thresholds."
+                f"Borrower: {borrower}\nIncome: £{income:,}\nLoan: £{loan:,}\nLTV: {ltv}\n"
+                "Recommendation: Manual review recommended for elevated LTV or weak affordability."
             )
         def fallback_answer(parsed: dict, question: str) -> str:
-            return "No LLM available. Please configure OPENAI_API_KEY for richer answers."
+            return "LLM not available. Please configure OPENAI_API_KEY for richer answers."
         return fallback_summary, fallback_answer
 
 def load_reporting_module() -> typing.Optional[typing.Any]:
-    """
-    Return the app.reporting module if available (so we can call its chart helpers).
-    """
     try:
         import app.reporting as reporting  # type: ignore
         return reporting
     except Exception as e:
+        # not fatal; reporting module optional
         print("REPORTING IMPORT ERROR:", e)
         return None
 
-# ---------- improved amortization & metrics ----------
+# ----------------- amortization & metrics (unchanged core calculations) -----------------
 def amortization_schedule(loan_amount: float, annual_rate_decimal: float, term_months: int) -> pd.DataFrame:
-    """
-    Accurate amortization schedule:
-      - annual_rate_decimal expected in decimal (e.g., 0.055 for 5.5%)
-      - returns DataFrame with month,payment,interest,principal,balance
-    """
     P = float(loan_amount)
     n = int(term_months)
     r = float(annual_rate_decimal) / 12.0 if annual_rate_decimal else 0.0
@@ -108,7 +107,6 @@ def amortization_schedule(loan_amount: float, annual_rate_decimal: float, term_m
     for m in range(1, n + 1):
         interest = balance * r
         principal = payment - interest
-        # last payment adjust
         if m == n:
             principal = balance
             payment = interest + principal
@@ -125,14 +123,6 @@ def amortization_schedule(loan_amount: float, annual_rate_decimal: float, term_m
     return pd.DataFrame(rows)
 
 def compute_lending_metrics(parsed: dict) -> dict:
-    """
-    Improved and consistent metrics:
-    - LTV = loan/property_value
-    - LTC = loan/total_cost (if provided)
-    - Use amortization schedule when rate & term exist to compute monthly payment and total interest
-    - DSCR computed as NOI / annual_debt_service (NOI detection/proxy kept)
-    - Risk score + category computed with clear thresholds
-    """
     lm = {}
     loan = float(parsed.get("loan_amount") or parsed.get("loan") or 0.0)
     prop = parsed.get("property_value") or None
@@ -158,25 +148,24 @@ def compute_lending_metrics(parsed: dict) -> dict:
         ltc = None
     lm["ltc"] = round(ltc, 4) if isinstance(ltc, (int, float)) else None
 
-    # Try compute amortization if rate & term present
+    # rate & term normalization
     rate_raw = parsed.get("interest_rate_annual") or parsed.get("interest_rate") or parsed.get("rate")
     term_months = parsed.get("term_months") or parsed.get("term") or None
-    amort_df = None
-    monthly_payment = parsed.get("monthly_payment")
-    total_interest = parsed.get("total_interest")
-
-    # Normalize rate into decimal
     rate_decimal = None
     if rate_raw is not None:
         try:
             r = float(rate_raw)
-            if r > 1:  # likely percent like 5.5
+            if r > 1:
                 r = r / 100.0
             rate_decimal = r
         except Exception:
             rate_decimal = None
 
-    if (rate_decimal is not None) and term_months:
+    amort_df = None
+    monthly_payment = parsed.get("monthly_payment")
+    total_interest = parsed.get("total_interest")
+
+    if rate_decimal is not None and term_months:
         try:
             amort_df = amortization_schedule(loan, rate_decimal, int(term_months))
             monthly_payment = float(amort_df["payment"].iloc[0])
@@ -185,9 +174,7 @@ def compute_lending_metrics(parsed: dict) -> dict:
             print("Amortization generation failed:", e)
             amort_df = None
 
-    # If amortization not available, try best-effort monthly payment
     if monthly_payment is None:
-        # try simple formula if rate_decimal & term_months
         try:
             if rate_decimal is not None and term_months:
                 r = rate_decimal
@@ -203,14 +190,9 @@ def compute_lending_metrics(parsed: dict) -> dict:
 
     lm["monthly_payment"] = round(monthly_payment, 2) if isinstance(monthly_payment, (int, float)) else None
     lm["total_interest"] = round(total_interest, 2) if isinstance(total_interest, (int, float)) else None
+    lm["annual_debt_service"] = round(lm["monthly_payment"] * 12.0, 2) if lm.get("monthly_payment") else None
 
-    # Annual debt service
-    if lm.get("monthly_payment"):
-        lm["annual_debt_service"] = round(lm["monthly_payment"] * 12.0, 2)
-    else:
-        lm["annual_debt_service"] = None
-
-    # NOI detection / proxy (same approach but explicit)
+    # NOI detection / proxy
     noi = parsed.get("noi") or parsed.get("net_operating_income")
     if noi is None:
         annual_rent = parsed.get("annual_rent") or parsed.get("rental_income_annual")
@@ -240,26 +222,23 @@ def compute_lending_metrics(parsed: dict) -> dict:
         dscr = None
     lm["dscr"] = round(dscr, 3) if isinstance(dscr, (int, float)) else None
 
-    # Flags
+    # flags
     policy_flags = parsed.get("policy_flags") or parsed.get("flags") or []
     bank_red_flags = parsed.get("bank_red_flags") or []
     lm["policy_flags"] = policy_flags
     lm["bank_red_flags"] = bank_red_flags
 
-    # Risk scoring: clearer mapping & thresholds
-    # Normalize LTV risk (0..1)
+    # risk scoring (clear thresholds)
     ltv_risk = 0.0
     if lm.get("ltv") is not None:
-        ltv_val = lm["ltv"]
-        # below 60% -> low, 60-80 medium, 80+ high
-        if ltv_val < 0.6:
+        v = lm["ltv"]
+        if v < 0.6:
             ltv_risk = 0.0
-        elif ltv_val < 0.8:
+        elif v < 0.8:
             ltv_risk = 0.5
         else:
             ltv_risk = 1.0
 
-    # DSCR risk: lower than 1.0 bad, 1.0-1.25 caution, >1.25 good
     dscr_risk = 1.0
     if lm.get("dscr") is not None:
         d = lm["dscr"]
@@ -272,20 +251,17 @@ def compute_lending_metrics(parsed: dict) -> dict:
 
     flags_risk = 1.0 if (policy_flags or bank_red_flags) else 0.0
 
-    # Weighted aggregate
     risk_score = (0.5 * ltv_risk) + (0.35 * dscr_risk) + (0.15 * flags_risk)
     risk_score = min(max(risk_score, 0.0), 1.0)
     lm["risk_score_computed"] = round(risk_score, 3)
-
     if risk_score >= 0.7:
-        category = "High"
+        lm["risk_category"] = "High"
     elif risk_score >= 0.4:
-        category = "Medium"
+        lm["risk_category"] = "Medium"
     else:
-        category = "Low"
-    lm["risk_category"] = category
+        lm["risk_category"] = "Low"
 
-    # Explainable reasons
+    # explainable reasons
     reasons = []
     if lm.get("ltv") is not None:
         if lm["ltv"] >= 0.85:
@@ -300,7 +276,7 @@ def compute_lending_metrics(parsed: dict) -> dict:
         reasons.append("No automated flags detected")
     lm["risk_reasons"] = reasons
 
-    # Attach amortization frame (small) for reporting use if present
+    # attach small amortization preview for reporting if available
     if amort_df is not None:
         lm["amortization_preview_rows"] = amort_df.head(6).to_dict(orient="records")
         lm["amortization_total_interest"] = round(amort_df["interest"].sum(), 2)
@@ -314,7 +290,7 @@ def compute_lending_metrics(parsed: dict) -> dict:
 os.makedirs(os.path.join(ROOT, "output", "generated_pdfs"), exist_ok=True)
 os.makedirs(os.path.join(ROOT, "output", "extracted_json"), exist_ok=True)
 
-# Header
+# ---- Header ----
 st.markdown(
     """
     <div class="bf-header">
@@ -331,7 +307,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Session defaults
+# session defaults
 defaults = {
     "generated_pdf": None,
     "uploaded_pdf": None,
@@ -344,10 +320,10 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Layout: left column (controls), right column (report)
+# layout columns
 left_col, right_col = st.columns([3, 2])
 
-# LEFT: controls (form, upload, calculator)
+# ---- LEFT: controls (form, upload, calculator) ----
 with left_col:
     st.markdown('<div class="bf-card">', unsafe_allow_html=True)
     tab_form, tab_upload, tab_calc = st.tabs(["Fill Form (generate PDF)", "Upload PDF", "Quick Calculator"])
@@ -458,12 +434,11 @@ with left_col:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# RIGHT: selection, analysis, and professional report visuals
+# ---- RIGHT: selection, analysis, and professional report visuals ----
 with right_col:
     st.markdown('<div class="bf-card">', unsafe_allow_html=True)
     st.subheader("Selected PDF / Calculation")
 
-    # list generated PDFs
     def list_generated_pdfs():
         out_dir = os.path.join(ROOT, "output", "generated_pdfs")
         os.makedirs(out_dir, exist_ok=True)
@@ -512,12 +487,12 @@ with right_col:
 
     st.markdown("**Automatically derived lending metrics help underwriters make fast decisions.**")
 
-    # ANALYSE button
+    # Analysis button
     if st.button("Analyse With AI"):
         generate_summary, answer_question = load_summarizer()
         reporting = load_reporting_module()
 
-        # If calculator selected -> build parsed dict
+        # Build parsed object and compute metrics
         if tmp_parsed:
             parsed = {
                 "borrower": tmp_parsed.get("borrower"),
@@ -540,45 +515,47 @@ with right_col:
             st.subheader("Underwriter Summary (calculation)")
             st.write(summary_text)
 
-            # Professional report layout
-            # Top: KPI cards in a single row
+            # Render a professional grid layout for charts & KPIs
+            # Top KPI row
             k1, k2, k3 = st.columns([1,1,1])
             try:
                 with k1:
-                    st.metric("LTV", f"{metrics.get('ltv'):.0%}" if isinstance(metrics.get('ltv'), float) else metrics.get('ltv') or "N/A")
+                    st.metric("LTV", f"{metrics.get('ltv'):.0%}" if isinstance(metrics.get('ltv'), float) else (metrics.get('ltv') or "N/A"))
                 with k2:
                     st.metric("DSCR", f"{metrics.get('dscr'):.2f}" if metrics.get('dscr') is not None else "N/A")
                 with k3:
-                    st.metric("Risk", f"{metrics.get('risk_score_computed', 'N/A'):.0%}" if isinstance(metrics.get('risk_score_computed'), float) else metrics.get('risk_score_computed') or "N/A")
+                    st.metric("Risk", f"{metrics.get('risk_score_computed', 'N/A'):.0%}" if isinstance(metrics.get('risk_score_computed'), float) else (metrics.get('risk_score_computed') or "N/A"))
             except Exception:
                 pass
 
-            # Middle: two-column balanced layout: left wide amortization & stacked, right charts
+            # Middle balanced layout: left wide for amortization, right column split into stacked charts
             left_wide, right_narrow = st.columns([2,1])
             with left_wide:
                 st.markdown("### Amortization & Monthly Breakdown")
-                # prefer building amortization schedule if possible
                 try:
                     rate_raw = parsed.get("interest_rate_annual")
                     term = parsed.get("term_months")
                     rate = None
                     if rate_raw is not None:
-                        rate = float(rate_raw) if float(rate_raw) <= 1 else float(rate_raw) / 100.0
+                        r = float(rate_raw)
+                        if r > 1:
+                            r = r / 100.0
+                        rate = r
                     if rate is not None and term:
                         df_am = amortization_schedule(parsed.get("loan_amount",0), rate, int(term))
-                        # line chart for balance
+                        # Balance chart
                         base = alt.Chart(df_am).encode(x=alt.X("month:Q", title="Month"))
                         balance_line = base.mark_line(color="#1f77b4", strokeWidth=2).encode(y=alt.Y("balance:Q", title="Remaining balance (£)"))
                         balance_area = base.mark_area(opacity=0.12, color="#1f77b4").encode(y="balance:Q")
-                        st.altair_chart((balance_area + balance_line).properties(height=280), use_container_width=True)
-                        # stacked principal vs interest
+                        st.altair_chart((balance_area + balance_line).properties(height=260), use_container_width=True)
+                        # Stacked principal / interest
                         src = df_am.melt(id_vars=["month"], value_vars=["principal","interest"], var_name="component", value_name="amount")
                         stacked = alt.Chart(src).mark_area().encode(
                             x="month:Q",
                             y=alt.Y("amount:Q", title="Amount (£)"),
                             color=alt.Color("component:N", scale=alt.Scale(range=["#2ca02c","#ff7f0e"])),
                             tooltip=["month","component",alt.Tooltip("amount:Q", format=",.2f")]
-                        ).properties(height=220)
+                        ).properties(height=200)
                         st.altair_chart(stacked, use_container_width=True)
                     else:
                         st.info("Amortization schedule not available: provide interest rate and term to show schedule.")
@@ -589,14 +566,12 @@ with right_col:
                 st.markdown("### Payment Composition")
                 try:
                     if 'df_am' in locals():
-                        total_principal = df_am["principal"].sum()
-                        total_interest = df_am["interest"].sum()
-                        pie_df = pd.DataFrame([{"part":"Principal","value":total_principal},{"part":"Interest","value":total_interest}])
+                        pie_df = pd.DataFrame([{"part":"Principal","value":df_am["principal"].sum()},{"part":"Interest","value":df_am["interest"].sum()}])
                         pie = alt.Chart(pie_df).mark_arc(innerRadius=40).encode(
                             theta=alt.Theta("value:Q"),
                             color=alt.Color("part:N", scale=alt.Scale(range=["#2ca02c","#ff7f0e"])),
                             tooltip=["part", alt.Tooltip("value:Q", format=",.2f")]
-                        ).properties(height=220)
+                        ).properties(height=200)
                         st.altair_chart(pie, use_container_width=True)
                     else:
                         if metrics.get("total_interest") is not None:
@@ -610,7 +585,7 @@ with right_col:
                     payment = metrics.get("monthly_payment") or 0
                     df_aff = pd.DataFrame([{"label":"Monthly payment","value":payment},{"label":"Monthly income","value":income_monthly}])
                     bars = alt.Chart(df_aff).mark_bar().encode(x="label:N", y=alt.Y("value:Q", title="Amount (£)"), color=alt.Color("label:N"))
-                    st.altair_chart(bars.properties(height=180), use_container_width=True)
+                    st.altair_chart(bars.properties(height=140), use_container_width=True)
                     if income_monthly:
                         st.write(f"Payment / Income = {(payment / income_monthly):.2f}x")
                 except Exception:
@@ -618,19 +593,27 @@ with right_col:
 
                 st.markdown("### Risk Breakdown")
                 try:
-                    # simple donut computed from metrics
                     aff_score = max(min(1 - (metrics.get("ltv") or 0), 1.0), 0.0) if metrics.get("ltv") is not None else 0.33
                     ltv_score = metrics.get("ltv") or 0
                     flag_score = 1.0 if metrics.get("policy_flags") or metrics.get("bank_red_flags") else 0.0
                     total = (aff_score + ltv_score + flag_score) or 1.0
                     df_r = pd.DataFrame({"factor":["Affordability","LTV risk","Flags"], "value":[aff_score/total*100, ltv_score/total*100, flag_score/total*100]})
                     donut = alt.Chart(df_r).mark_arc(innerRadius=40).encode(theta=alt.Theta("value:Q"), color=alt.Color("factor:N"))
-                    st.altair_chart(donut.properties(height=180), use_container_width=True)
+                    st.altair_chart(donut.properties(height=140), use_container_width=True)
                     st.write("Reasons:", "; ".join(metrics.get("risk_reasons",[])))
                 except Exception:
                     pass
 
-            # Download JSON report
+            # Attempt to render additional reporting visuals (non-blocking)
+            reporting = load_reporting_module()
+            if reporting:
+                try:
+                    # Render below the main grid (reporting should avoid re-duplicating the same charts)
+                    reporting.render_full_report(parsed, metrics)
+                except Exception as e:
+                    print("REPORTING.render_full_report error:", e)
+
+            # Download JSON
             try:
                 buf = io.BytesIO()
                 payload = {"parsed": parsed, "lending_metrics": metrics, "summary": summary_text}
@@ -639,15 +622,6 @@ with right_col:
                 st.download_button("Download report (JSON)", data=buf, file_name="calculation_report.json", mime="application/json")
             except Exception:
                 pass
-
-            # If reporting module with richer visuals exists, render it below (non-blocking)
-            reporting = load_reporting_module()
-            if reporting:
-                try:
-                    # reporting.render_full_report may duplicate some visuals — it will render below
-                    reporting.render_full_report(parsed, metrics)
-                except Exception as e:
-                    print("REPORTING.render_full_report error:", e)
 
         elif tmp_file:
             proc_pdf, proc_data = load_pipeline()
@@ -663,7 +637,6 @@ with right_col:
                         st.subheader("Extracted / Analysis JSON")
                         st.json(result)
 
-                        # Summary
                         generate_summary, _ = load_summarizer()
                         try:
                             summary_text = generate_summary(result)
@@ -672,16 +645,15 @@ with right_col:
                         st.subheader("Underwriter Summary")
                         st.write(summary_text)
 
-                        # KPI row
+                        # KPI row and balanced grid (same pattern as calculator path)
                         k1, k2, k3 = st.columns([1,1,1])
                         with k1:
-                            st.metric("LTV", f"{metrics.get('ltv'):.0%}" if isinstance(metrics.get('ltv'), float) else metrics.get('ltv') or "N/A")
+                            st.metric("LTV", f"{metrics.get('ltv'):.0%}" if isinstance(metrics.get('ltv'), float) else (metrics.get('ltv') or "N/A"))
                         with k2:
                             st.metric("DSCR", f"{metrics.get('dscr'):.2f}" if metrics.get('dscr') is not None else "N/A")
                         with k3:
-                            st.metric("Risk", f"{metrics.get('risk_score_computed', 'N/A'):.0%}" if isinstance(metrics.get('risk_score_computed'), float) else metrics.get('risk_score_computed') or "N/A")
+                            st.metric("Risk", f"{metrics.get('risk_score_computed', 'N/A'):.0%}" if isinstance(metrics.get('risk_score_computed'), float) else (metrics.get('risk_score_computed') or "N/A"))
 
-                        # Balanced middle layout (amortization + charts)
                         left_wide, right_narrow = st.columns([2,1])
                         with left_wide:
                             st.markdown("### Amortization & Monthly Breakdown")
@@ -690,16 +662,19 @@ with right_col:
                                 term = result.get("term_months")
                                 rate = None
                                 if rate_raw is not None:
-                                    rate = float(rate_raw) if float(rate_raw) <= 1 else float(rate_raw) / 100.0
+                                    r = float(rate_raw)
+                                    if r > 1:
+                                        r = r / 100.0
+                                    rate = r
                                 if rate is not None and term:
                                     df_am = amortization_schedule(result.get("loan_amount",0), rate, int(term))
                                     base = alt.Chart(df_am).encode(x=alt.X("month:Q", title="Month"))
                                     balance_line = base.mark_line(color="#1f77b4", strokeWidth=2).encode(y=alt.Y("balance:Q", title="Remaining balance (£)"))
                                     balance_area = base.mark_area(opacity=0.12, color="#1f77b4").encode(y="balance:Q")
-                                    st.altair_chart((balance_area + balance_line).properties(height=280), use_container_width=True)
+                                    st.altair_chart((balance_area + balance_line).properties(height=260), use_container_width=True)
                                     src = df_am.melt(id_vars=["month"], value_vars=["principal","interest"], var_name="component", value_name="amount")
                                     stacked = alt.Chart(src).mark_area().encode(x="month:Q", y=alt.Y("amount:Q", title="Amount (£)"), color=alt.Color("component:N"))
-                                    st.altair_chart(stacked.properties(height=220), use_container_width=True)
+                                    st.altair_chart(stacked.properties(height=200), use_container_width=True)
                                 else:
                                     st.info("Amortization schedule not available.")
                             except Exception as e:
@@ -711,7 +686,7 @@ with right_col:
                                 if 'df_am' in locals():
                                     pie_df = pd.DataFrame([{"part":"Principal","value":df_am["principal"].sum()},{"part":"Interest","value":df_am["interest"].sum()}])
                                     pie = alt.Chart(pie_df).mark_arc(innerRadius=40).encode(theta=alt.Theta("value:Q"), color=alt.Color("part:N"))
-                                    st.altair_chart(pie.properties(height=220), use_container_width=True)
+                                    st.altair_chart(pie.properties(height=200), use_container_width=True)
                             except Exception:
                                 pass
 
@@ -721,7 +696,7 @@ with right_col:
                                 payment = metrics.get("monthly_payment") or 0
                                 df_aff = pd.DataFrame([{"label":"Monthly payment","value":payment},{"label":"Monthly income","value":income_monthly}])
                                 bars = alt.Chart(df_aff).mark_bar().encode(x="label:N", y=alt.Y("value:Q", title="Amount (£)"), color=alt.Color("label:N"))
-                                st.altair_chart(bars.properties(height=180), use_container_width=True)
+                                st.altair_chart(bars.properties(height=140), use_container_width=True)
                                 if income_monthly:
                                     st.write(f"Payment / Income = {(payment / income_monthly):.2f}x")
                             except Exception:
@@ -735,12 +710,12 @@ with right_col:
                                 total = (aff_score + ltv_score + flag_score) or 1.0
                                 df_r = pd.DataFrame({"factor":["Affordability","LTV risk","Flags"], "value":[aff_score/total*100, ltv_score/total*100, flag_score/total*100]})
                                 donut = alt.Chart(df_r).mark_arc(innerRadius=40).encode(theta=alt.Theta("value:Q"), color=alt.Color("factor:N"))
-                                st.altair_chart(donut.properties(height=180), use_container_width=True)
+                                st.altair_chart(donut.properties(height=140), use_container_width=True)
                                 st.write("Reasons:", "; ".join(metrics.get("risk_reasons",[])))
                             except Exception:
                                 pass
 
-                        # render additional reporting visuals if module available
+                        # optional reporting module
                         reporting = load_reporting_module()
                         if reporting:
                             try:
@@ -751,8 +726,6 @@ with right_col:
                     except Exception as e:
                         st.error("Pipeline failed during processing. See logs.")
                         print("PIPELINE RUN ERROR:", e)
-        else:
-            st.error("No PDF or calculation available to analyse.")
 
     # Persistent Q&A
     st.markdown("---")
@@ -767,7 +740,6 @@ with right_col:
             if not parsed:
                 st.error("No analysis available. Run 'Analyse With AI' first.")
             else:
-                # Deterministic first for common queries for explainability
                 q = question.lower()
                 metrics = parsed.get("lending_metrics") or compute_lending_metrics(parsed)
                 if ("why" in q and ("flag" in q or "risk" in q)):

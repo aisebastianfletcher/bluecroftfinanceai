@@ -1,6 +1,10 @@
-# Polished Bluecroft Finance UI with robust session-state handling, safe lazy imports,
-# background CSS loader, professional report generation (including pie chart),
-# and persistent Q&A that uses the last analysis as context.
+# Polished Bluecroft Finance UI (complete app/main.py)
+# - Robust session-state handling
+# - Safe lazy imports for pipeline/summariser/reporting
+# - Quick calculator + PDF generate/upload flows
+# - Automated lending metrics (LTV, LTC, DSCR, risk score/category)
+# - Professional report rendering (calls app.reporting.render_full_report when available)
+# - Persistent Q&A using last analysis as context
 import os
 import sys
 from pathlib import Path
@@ -10,44 +14,28 @@ import json
 import io
 import typing
 
-# Ensure repo root is on sys.path
+# Ensure repo root is on sys.path so local packages import correctly
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import streamlit as st
-# load custom styles (app/static/styles.css) safely AFTER streamlit is available
-from pathlib import Path
-_css_path = Path(__file__).parent / "static" / "styles.css"
-if _css_path.exists():
-    try:
-        _css_text = _css_path.read_text(encoding="utf-8")
-        st.markdown(f"<style>{_css_text}</style>", unsafe_allow_html=True)
-    except Exception:
-        pass
-# optional: minimal inline fallback so header/background still looks okay even if file missing
-else:
-    st.markdown(
-        "<style>"
-        ".bf-header { background: linear-gradient(90deg,#003366,#0078D4); color:white; padding:12px 18px; border-radius:8px; }"
-        ".stApp { background: linear-gradient(180deg,#eaf2ff,#ffffff); }"
-        "</style>",
-        unsafe_allow_html=True,
-    )
 import pandas as pd
 import altair as alt
 
-# Load optional CSS (keeps UI safe if file missing)
+# Page config
+st.set_page_config(page_title="Bluecroft Finance — AI Lending Assistant", layout="wide")
+
+# Load optional CSS (safe: no error if missing)
 _css_path = Path(__file__).parent / "static" / "styles.css"
 if _css_path.exists():
     try:
         _css_text = _css_path.read_text(encoding="utf-8")
         st.markdown(f"<style>{_css_text}</style>", unsafe_allow_html=True)
     except Exception:
-        # silently ignore CSS errors so UI still loads
         pass
 else:
-    # Inline minimal fallback styling so title and header always look OK even if CSS missing
+    # Minimal inline fallback so header looks ok even if file missing
     st.markdown(
         """
         <style>
@@ -58,10 +46,12 @@ else:
         unsafe_allow_html=True,
     )
 
-st.set_page_config(page_title="Bluecroft Finance — AI Lending Assistant", layout="wide")
-
-# Lazy loaders to avoid import-time crashes if pipeline/llm have issues
+# ----------------- Lazy import helpers -----------------
 def load_pipeline() -> typing.Tuple[typing.Optional[typing.Callable], typing.Optional[typing.Callable]]:
+    """
+    Lazy import of the processing pipeline so app startup remains resilient.
+    Returns (process_pdf, process_data) or (None, None) if import fails.
+    """
     try:
         from pipeline.pipeline import process_pdf, process_data  # type: ignore
         return process_pdf, process_data
@@ -71,44 +61,202 @@ def load_pipeline() -> typing.Tuple[typing.Optional[typing.Callable], typing.Opt
 
 def load_summarizer() -> typing.Tuple[typing.Callable, typing.Callable]:
     """
-    Returns (generate_summary(parsed), answer_question(parsed, question)).
-    If the real summarizer can't be imported, return deterministic fallbacks.
+    Lazy import summarizer functions. Provide deterministic fallbacks when unavailable.
+    Returns (generate_summary, answer_question).
     """
     try:
         from pipeline.llm.summarizer import generate_summary, answer_question  # type: ignore
         return generate_summary, answer_question
     except Exception as e:
         print("SUMMARIZER IMPORT ERROR:", e)
+        # Deterministic fallback summary and simple QA
         def fallback_summary(parsed: dict) -> str:
             borrower = parsed.get("borrower", "Unknown")
             income = parsed.get("income", "N/A")
             loan = parsed.get("loan_amount", "N/A")
-            ltv = parsed.get("ltv", "N/A")
-            flags = parsed.get("policy_flags", [])
+            lm = parsed.get("lending_metrics", {}) or {}
+            ltv = lm.get("ltv", "N/A")
+            risk_cat = lm.get("risk_category", "N/A")
             return (
                 f"Borrower: {borrower}\n"
                 f"Income: £{income:,}\n"
                 f"Loan amount: £{loan:,}\n"
                 f"LTV: {ltv}\n"
-                f"Policy flags: {', '.join(flags) if flags else 'None'}\n\n"
+                f"Risk category: {risk_cat}\n\n"
                 "Recommendation: Manual review recommended for elevated LTV or weak affordability."
             )
         def fallback_answer(parsed: dict, question: str) -> str:
             q = question.lower()
-            if "ltv" in q:
-                return f"LTV: {parsed.get('ltv', 'N/A')}"
-            if "income" in q:
-                return f"Income: £{parsed.get('income', 'N/A')}"
-            if "monthly" in q or "payment" in q:
-                return f"Monthly payment: £{parsed.get('monthly_payment', 'N/A')}"
-            return "No LLM available. Please configure OPENAI_API_KEY to enable richer answers."
+            lm = parsed.get("lending_metrics", {}) or {}
+            if "why" in q and ("flag" in q or "risk" in q):
+                return "Reasons: " + "; ".join(lm.get("risk_reasons", ["No automated reasons available."]))
+            if "summar" in q or "financial position" in q:
+                return fallback_summary(parsed)
+            if "bridge" in q:
+                term_ok = parsed.get("term_months") is not None and parsed.get("term_months") <= 24
+                ltv_ok = lm.get("ltv") is not None and lm.get("ltv") <= 0.75
+                dscr_ok = lm.get("dscr") is None or lm.get("dscr") >= 1.0
+                ok = term_ok and ltv_ok and dscr_ok
+                return "Suitable for typical bridging: " + ("Yes" if ok else "No")
+            return "LLM not available. Please configure OPENAI_API_KEY for richer answers."
         return fallback_summary, fallback_answer
 
-# Ensure output dirs exist
+def load_reporting() -> typing.Optional[typing.Callable]:
+    """
+    Lazy import of reporting.render_full_report if available.
+    """
+    try:
+        from app.reporting import render_full_report  # type: ignore
+        return render_full_report
+    except Exception as e:
+        print("REPORTING IMPORT ERROR:", e)
+        return None
+
+# ----------------- Lending metrics computation -----------------
+def compute_lending_metrics(parsed: dict) -> dict:
+    """
+    Compute LTV, LTC, DSCR, risk score and category and attach as parsed['lending_metrics'].
+    Returns the lending metrics dict.
+    """
+    lm = {}
+    loan = parsed.get("loan_amount") or parsed.get("loan") or 0.0
+    prop = parsed.get("property_value") or parsed.get("property_value_estimate") or None
+    total_cost = parsed.get("project_cost") or parsed.get("total_cost") or None
+
+    # LTV
+    try:
+        if prop and prop > 0:
+            ltv = float(loan) / float(prop)
+        else:
+            ltv = None
+    except Exception:
+        ltv = None
+    lm["ltv"] = round(ltv, 4) if isinstance(ltv, (int, float)) else None
+
+    # LTC
+    try:
+        if total_cost and total_cost > 0:
+            ltc = float(loan) / float(total_cost)
+        else:
+            ltc = None
+    except Exception:
+        ltc = None
+    lm["ltc"] = round(ltc, 4) if isinstance(ltc, (int, float)) else None
+
+    # Monthly payment attempt (if not present)
+    monthly_payment = parsed.get("monthly_payment")
+    if not monthly_payment:
+        rate = parsed.get("interest_rate_annual") or parsed.get("interest_rate") or None
+        term_months = parsed.get("term_months") or parsed.get("term") or None
+        try:
+            if rate and term_months:
+                # Accept percent-style (5.5) or decimal (0.055)
+                r = float(rate)
+                if r > 1:
+                    r = r / 100.0
+                n = int(term_months)
+                if r == 0:
+                    monthly_payment = float(loan) / n
+                else:
+                    monthly_payment = float(loan) * (r / 12.0) / (1 - (1 + r / 12.0) ** (-n))
+            else:
+                monthly_payment = None
+        except Exception:
+            monthly_payment = None
+    lm["monthly_payment"] = round(monthly_payment, 2) if isinstance(monthly_payment, (int, float)) else None
+
+    # Annual debt service
+    if lm.get("monthly_payment"):
+        annual_debt_service = lm["monthly_payment"] * 12.0
+    else:
+        annual_debt_service = None
+    lm["annual_debt_service"] = round(annual_debt_service, 2) if annual_debt_service else None
+
+    # NOI detection or proxy
+    noi = parsed.get("noi") or parsed.get("net_operating_income")
+    if not noi:
+        annual_rent = parsed.get("annual_rent") or parsed.get("rental_income_annual")
+        operating_expenses = parsed.get("operating_expenses") or parsed.get("annual_expenses")
+        if annual_rent is not None:
+            try:
+                noi = float(annual_rent) - float(operating_expenses or 0)
+                lm["noi_estimated_from_rent"] = True
+            except Exception:
+                noi = None
+        else:
+            borrower_income = parsed.get("income")
+            if borrower_income:
+                noi = borrower_income * 0.30
+                lm["noi_estimated_from_income_proxy"] = True
+            else:
+                noi = None
+    lm["noi"] = round(noi, 2) if isinstance(noi, (int, float)) else None
+
+    # DSCR
+    dscr = None
+    try:
+        if lm.get("noi") and annual_debt_service and annual_debt_service > 0:
+            dscr = lm["noi"] / annual_debt_service
+    except Exception:
+        dscr = None
+    lm["dscr"] = round(dscr, 3) if isinstance(dscr, (int, float)) else None
+
+    # Flags
+    policy_flags = parsed.get("policy_flags") or parsed.get("flags") or []
+    bank_red_flags = parsed.get("bank_red_flags") or []
+    lm["policy_flags"] = policy_flags
+    lm["bank_red_flags"] = bank_red_flags
+
+    # Risk scoring heuristics
+    ltv_risk = 0.0
+    if lm.get("ltv") is not None:
+        ltv_val = lm["ltv"]
+        ltv_risk = min(max((ltv_val - 0.5) / 0.5, 0.0), 1.0)
+
+    dscr_risk = 1.0
+    if lm.get("dscr") is not None:
+        d = lm["dscr"]
+        if d >= 1.5:
+            dscr_risk = 0.0
+        else:
+            dscr_risk = min(max((1.5 - d) / 0.7, 0.0), 1.0)
+
+    flags_risk = 1.0 if (policy_flags or bank_red_flags) else 0.0
+
+    risk_score = 0.55 * ltv_risk + 0.35 * dscr_risk + 0.10 * flags_risk
+    risk_score = min(max(risk_score, 0.0), 1.0)
+    lm["risk_score_computed"] = round(risk_score, 3)
+
+    if risk_score >= 0.7:
+        category = "High"
+    elif risk_score >= 0.4:
+        category = "Medium"
+    else:
+        category = "Low"
+    lm["risk_category"] = category
+
+    # Explainable reasons
+    reasons = []
+    if lm.get("ltv") is not None and lm["ltv"] >= 0.85:
+        reasons.append(f"High LTV ({lm['ltv']:.2f})")
+    elif lm.get("ltv") is not None and lm["ltv"] >= 0.75:
+        reasons.append(f"Elevated LTV ({lm['ltv']:.2f})")
+    if lm.get("dscr") is not None and lm["dscr"] < 1.0:
+        reasons.append(f"DSCR below 1.0 ({lm['dscr']:.2f})")
+    if flags_risk:
+        reasons.append("Policy / bank flags present")
+    if not reasons:
+        reasons.append("No major automated flags detected")
+    lm["risk_reasons"] = reasons
+
+    parsed["lending_metrics"] = lm
+    return lm
+
+# ----------------- Prepare output dirs -----------------
 os.makedirs(os.path.join(ROOT, "output", "generated_pdfs"), exist_ok=True)
 os.makedirs(os.path.join(ROOT, "output", "extracted_json"), exist_ok=True)
 
-# Header
+# ----------------- Header -----------------
 st.markdown(
     """
     <div class="bf-header">
@@ -117,7 +265,7 @@ st.markdown(
           Bluecroft Finance
         </div>
         <div style="flex:1;">
-          <p style="margin:0; color: #eaf6ff;">AI Lending Assistant — professional underwriting report & quick calculator</p>
+          <p style="margin:0; color: #eaf6ff;">AI Lending Assistant — underwriting metrics, professional report & Q&A</p>
         </div>
       </div>
     </div>
@@ -125,26 +273,27 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Ensure session state keys
-for k, v in [
-    ("generated_pdf", None),
-    ("uploaded_pdf", None),
-    ("calc_result", None),
-    ("last_analysis", None),
-    ("qa_question", ""),
-    ("qa_answer", None),
-]:
+# ----------------- Session state defaults -----------------
+defaults = {
+    "generated_pdf": None,
+    "uploaded_pdf": None,
+    "calc_result": None,
+    "last_analysis": None,
+    "qa_question": "",
+    "qa_answer": None,
+}
+for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Layout
+# ----------------- Layout -----------------
 left_col, right_col = st.columns([3, 2])
 
 with left_col:
     st.markdown('<div class="bf-card">', unsafe_allow_html=True)
     tab_form, tab_upload, tab_calc = st.tabs(["Fill Form (generate PDF)", "Upload PDF", "Quick Calculator"])
 
-    # Form tab
+    # --- FORM (generate PDF) ---
     with tab_form:
         st.markdown("Fill fields and click Generate PDF to create an application PDF.")
         with st.form("application_form"):
@@ -184,7 +333,7 @@ with left_col:
                 st.error("Failed to generate PDF. See logs.")
                 print("PDF GENERATION ERROR:", e)
 
-    # Upload tab
+    # --- UPLOAD ---
     with tab_upload:
         st.markdown("Upload an existing application or statement PDF for analysis.")
         uploaded = st.file_uploader("Upload application / statement PDF", type=["pdf"], accept_multiple_files=False, key="upload1")
@@ -204,9 +353,9 @@ with left_col:
                 st.error("Failed to save uploaded file. See logs.")
                 print("UPLOAD SAVE ERROR:", e)
 
-    # Calculator tab
+    # --- QUICK CALCULATOR ---
     with tab_calc:
-        st.markdown("Quick loan calculator — compute monthly payment and summary. You can analyse this calculation directly.")
+        st.markdown("Quick loan calculator — compute monthly payment and summary.")
         with st.form("calc_form"):
             ccol1, ccol2 = st.columns(2)
             with ccol1:
@@ -306,103 +455,78 @@ with right_col:
         except Exception:
             st.warning("Could not open the selected file for preview/download.")
 
+    st.markdown("**Automatically derived lending metrics help underwriters make fast decisions.**")
+
     # ANALYSE action
     if st.button("Analyse With AI"):
-        # Load summariser lazily
         generate_summary, answer_question = load_summarizer()
+        render_full_report = load_reporting()
 
-        # If calculator selected, prepare parsed dict and bypass PDF pipeline
         if tmp_parsed:
+            # analysis from calculator result
             parsed = {
                 "borrower": tmp_parsed.get("borrower"),
                 "income": tmp_parsed.get("income"),
                 "loan_amount": tmp_parsed.get("loan_amount"),
                 "property_value": tmp_parsed.get("property_value"),
-                "ltv": tmp_parsed.get("ltv"),
                 "monthly_payment": tmp_parsed.get("monthly_payment"),
-                "bank_red_flags": [],
-                "risk_score": None,
-                "policy_flags": [],
+                "total_interest": tmp_parsed.get("total_interest"),
+                "term_months": tmp_parsed.get("term_months"),
+                "interest_rate_annual": tmp_parsed.get("interest_rate_annual"),
             }
-            # persist last analysis for Q&A
+            metrics = compute_lending_metrics(parsed)
             st.session_state["last_analysis"] = parsed
-            # produce summary (LLM or fallback)
+
+            # Summary (LLM or fallback)
             try:
                 summary_text = generate_summary(parsed)
             except Exception as e:
                 summary_text = f"LLM_ERROR: {e}"
-            # show report
             st.subheader("Underwriter Summary (calculation)")
             st.write(summary_text)
 
-            # Produce a professional metrics report and pie chart
-            st.subheader("Calculation Report")
-            metrics = {
-                "Monthly payment": parsed.get("monthly_payment") or 0,
-                "Total interest": parsed.get("total_interest") or 0,
-                "LTV (fraction)": parsed.get("ltv") or 0,
-            }
-            # Build a pie-like chart for decision factors
-            aff_score = 0.0
-            ltv_score = 0.0
-            flags_score = 0.0
-            # Affordability heuristic: monthly / (income/12)
-            try:
-                income_m = (parsed.get("income") or 0) / 12.0
-                monthly = parsed.get("monthly_payment") or 0
-                if income_m > 0:
-                    aff_ratio = monthly / income_m
-                    # higher ratio -> worse affordability
-                    aff_score = min(max((aff_ratio - 0.2) * 5.0, 0.0), 1.0)  # scaled 0-1
-                else:
-                    aff_score = 1.0
-            except Exception:
-                aff_score = 0.0
-            # LTV heuristic
-            try:
-                ltv_val = parsed.get("ltv") or 0
-                if ltv_val >= 0.9:
-                    ltv_score = 1.0
-                else:
-                    ltv_score = max(0.0, (ltv_val - 0.6) / 0.4)  # maps 0.6->0, 1.0->1.0
-            except Exception:
-                ltv_score = 0.0
-            # flags
-            flags_score = 1.0 if parsed.get("policy_flags") else 0.0
-            # normalize to percentages for display
-            total = aff_score + ltv_score + flags_score
-            if total <= 0:
-                # default neutral weights
-                data = pd.DataFrame({
-                    "factor": ["Affordability", "LTV risk", "Policy flags"],
-                    "value": [1, 1, 1],
-                })
-            else:
-                data = pd.DataFrame({
-                    "factor": ["Affordability", "LTV risk", "Policy flags"],
-                    "value": [aff_score / total * 100, ltv_score / total * 100, flags_score / total * 100],
-                })
-            chart = alt.Chart(data).mark_arc(innerRadius=40).encode(
-                theta=alt.Theta("value:Q"),
-                color=alt.Color("factor:N", scale=alt.Scale(range=["#1f77b4", "#ff7f0e", "#2ca02c"])),
-                tooltip=["factor", "value"]
-            ).properties(width=300, height=300)
-            st.altair_chart(chart, use_container_width=True)
+            # Lending metrics table
+            st.subheader("Lending Metrics")
+            df_metrics = pd.DataFrame([
+                {"Metric": "LTV", "Value": f"{metrics.get('ltv') if metrics.get('ltv') is not None else 'N/A'}"},
+                {"Metric": "LTC", "Value": f"{metrics.get('ltc') if metrics.get('ltc') is not None else 'N/A'}"},
+                {"Metric": "DSCR", "Value": f"{metrics.get('dscr') if metrics.get('dscr') is not None else 'N/A'}"},
+                {"Metric": "Annual debt service", "Value": f"{metrics.get('annual_debt_service') if metrics.get('annual_debt_service') is not None else 'N/A'}"},
+                {"Metric": "Risk score", "Value": f"{metrics.get('risk_score_computed', 'N/A')}"},
+                {"Metric": "Risk category", "Value": f"{metrics.get('risk_category', 'N/A')}"},
+            ])
+            st.table(df_metrics)
 
-            # Key metrics table
-            st.table(pd.DataFrame({
-                "Metric": ["Income (annual)", "Loan amount", "Monthly payment", "LTV"],
-                "Value": [
-                    f"£{parsed.get('income', 0):,.2f}",
-                    f"£{parsed.get('loan_amount', 0):,.2f}",
-                    f"£{parsed.get('monthly_payment', 0):,.2f}",
-                    f"{parsed.get('ltv', 'N/A')}",
-                ]
-            }))
+            # Decision factors chart
+            try:
+                factors = pd.DataFrame({
+                    "factor": ["Affordability", "LTV risk", "Flags"],
+                    "value": [
+                        max(min((1 - (metrics.get("ltv") or 0)), 1.0) * 100, 0) if metrics.get("ltv") is not None else 33,
+                        (metrics.get("ltv") or 0) * 100 if metrics.get("ltv") is not None else 33,
+                        30 if metrics.get("policy_flags") or metrics.get("bank_red_flags") else 1,
+                    ]
+                })
+                chart = alt.Chart(factors).mark_arc(innerRadius=40).encode(
+                    theta=alt.Theta("value:Q"),
+                    color=alt.Color("factor:N", scale=alt.Scale(range=["#1f77b4", "#ff7f0e", "#d62728"])),
+                    tooltip=["factor", "value"]
+                ).properties(width=300, height=300)
+                st.altair_chart(chart, use_container_width=True)
+            except Exception:
+                pass
 
-            # Download report as JSON
+            # Try to render full reporting visuals (amortization, KPIs) if reporting module is present
+            if render_full_report:
+                try:
+                    render_full_report(parsed, metrics)
+                except Exception as e:
+                    print("REPORT RENDER ERROR:", e)
+
+            # Download report JSON
             buf = io.BytesIO()
-            buf.write(json.dumps({"parsed": parsed, "summary": summary_text}, indent=2).encode("utf-8"))
+            payload = {"parsed": parsed, "lending_metrics": metrics, "summary": summary_text}
+            buf.write(json.dumps(payload, indent=2).encode("utf-8"))
             buf.seek(0)
             st.download_button("Download report (JSON)", data=buf, file_name="calculation_report.json", mime="application/json")
 
@@ -414,83 +538,72 @@ with right_col:
                 with st.spinner("Running pipeline on PDF..."):
                     try:
                         result = proc_pdf(tmp_file)
-                        # persist last_analysis for Q&A
+                        # Compute lending metrics
+                        metrics = compute_lending_metrics(result)
                         st.session_state["last_analysis"] = result
+
                         st.subheader("Extracted / Analysis JSON")
                         st.json(result)
-                        # Save extracted JSON to output
+
+                        # Save extracted JSON (best-effort)
                         try:
                             from utils.file_utils import save_json  # type: ignore
                             save_json(result, os.path.join("output", "extracted_json", f"{os.path.basename(tmp_file)}.json"))
                         except Exception:
                             pass
 
-                        # Professional summary (LLM or fallback)
-                        generate_summary, _ = load_summarizer()
+                        # Summary
                         try:
                             summary_text = generate_summary(result)
                         except Exception as e:
                             summary_text = f"LLM_ERROR: {e}"
-
                         st.subheader("Underwriter Summary")
                         st.write(summary_text)
 
-                        # Prepare decision factors and chart (similar heuristics)
-                        st.subheader("Decision Factors")
-                        # derive numeric metrics if available
-                        monthly_payment = result.get("monthly_payment") or result.get("monthly") or 0
-                        income = result.get("income") or 0
-                        ltv = result.get("ltv") or 0
-                        policy_flags = result.get("policy_flags") or []
-                        bank_red_flags = result.get("bank_red_flags") or []
+                        # Lending metrics table
+                        st.subheader("Lending Metrics")
+                        df_metrics = pd.DataFrame([
+                            {"Metric": "LTV", "Value": f"{metrics.get('ltv') if metrics.get('ltv') is not None else 'N/A'}"},
+                            {"Metric": "LTC", "Value": f"{metrics.get('ltc') if metrics.get('ltc') is not None else 'N/A'}"},
+                            {"Metric": "DSCR", "Value": f"{metrics.get('dscr') if metrics.get('dscr') is not None else 'N/A'}"},
+                            {"Metric": "Annual debt service", "Value": f"{metrics.get('annual_debt_service') if metrics.get('annual_debt_service') is not None else 'N/A'}"},
+                            {"Metric": "Risk score", "Value": f"{metrics.get('risk_score_computed', 'N/A')}"},
+                            {"Metric": "Risk category", "Value": f"{metrics.get('risk_category', 'N/A')}"},
+                        ])
+                        st.table(df_metrics)
 
-                        # Affordability heuristic
-                        aff_score = 0.0
-                        if income and monthly_payment:
-                            income_m = income / 12.0
-                            aff_ratio = monthly_payment / income_m if income_m > 0 else 1.0
-                            aff_score = min(max((aff_ratio - 0.2) * 5.0, 0.0), 1.0)
-                        # LTV heuristic
-                        ltv_score = max(0.0, min((ltv - 0.6) / 0.4, 1.0)) if isinstance(ltv, (int, float)) else 0.0
-                        flags_score = 1.0 if policy_flags or bank_red_flags else 0.0
-
-                        total = aff_score + ltv_score + flags_score
-                        if total <= 0:
-                            data = pd.DataFrame({
+                        # Chart
+                        try:
+                            factors = pd.DataFrame({
                                 "factor": ["Affordability", "LTV risk", "Flags"],
-                                "value": [1, 1, 1],
+                                "value": [
+                                    max(min((1 - (metrics.get("ltv") or 0)), 1.0) * 100, 0) if metrics.get("ltv") is not None else 33,
+                                    (metrics.get("ltv") or 0) * 100 if metrics.get("ltv") is not None else 33,
+                                    30 if metrics.get("policy_flags") or metrics.get("bank_red_flags") else 1,
+                                ]
                             })
-                        else:
-                            data = pd.DataFrame({
-                                "factor": ["Affordability", "LTV risk", "Flags"],
-                                "value": [aff_score / total * 100, ltv_score / total * 100, flags_score / total * 100],
-                            })
-                        chart = alt.Chart(data).mark_arc(innerRadius=40).encode(
-                            theta=alt.Theta("value:Q"),
-                            color=alt.Color("factor:N", scale=alt.Scale(range=["#1f77b4", "#ff7f0e", "#d62728"])),
-                            tooltip=["factor", "value"]
-                        ).properties(width=300, height=300)
-                        st.altair_chart(chart, use_container_width=True)
+                            chart = alt.Chart(factors).mark_arc(innerRadius=40).encode(
+                                theta=alt.Theta("value:Q"),
+                                color=alt.Color("factor:N", scale=alt.Scale(range=["#1f77b4", "#ff7f0e", "#d62728"])),
+                                tooltip=["factor", "value"]
+                            ).properties(width=300, height=300)
+                            st.altair_chart(chart, use_container_width=True)
+                        except Exception:
+                            pass
 
-                        # Key metrics table
-                        st.table(pd.DataFrame({
-                            "Metric": ["Income (annual)", "Loan amount", "Monthly payment", "LTV"],
-                            "Value": [
-                                f"£{income:,.2f}" if income else "N/A",
-                                f"£{result.get('loan_amount', 0):,.2f}",
-                                f"£{monthly_payment:,.2f}" if monthly_payment else "N/A",
-                                f"{ltv}",
-                            ]
-                        }))
-
+                        # Render full report visuals if available
+                        if render_full_report:
+                            try:
+                                render_full_report(result, metrics)
+                            except Exception as e:
+                                print("REPORT RENDER ERROR:", e)
                     except Exception as e:
                         st.error("Pipeline failed during processing. See logs.")
                         print("PIPELINE RUN ERROR:", e)
-
         else:
             st.error("No PDF or calculation available to analyse.")
 
-    # Persistent Q&A UI
+    # ---------- Persistent Q&A ----------
     st.markdown("---")
     st.subheader("Ask a question about this application")
     st.text_input("Enter natural language question", key="qa_question")
@@ -504,16 +617,56 @@ with right_col:
             if not parsed:
                 st.error("No analysis available to ask about. Run 'Analyse With AI' first (or select a calculation).")
             else:
-                # Prefer pipeline Q&A if available
-                proc_pdf, proc_data = load_pipeline()
-                try:
+                # Deterministic responses for common stakeholder queries first
+                qlow = question.lower()
+                metrics = parsed.get("lending_metrics") or compute_lending_metrics(parsed)
+                answer = None
+
+                if ("why" in qlow and ("flag" in qlow or "risk" in qlow)):
+                    reasons = metrics.get("risk_reasons", ["No specific reasons available."])
+                    answer = "I flagged risk because: " + "; ".join(reasons)
+                elif ("summar" in qlow) or ("financial position" in qlow):
+                    generate_summary, _ = load_summarizer()
+                    try:
+                        answer = generate_summary(parsed)
+                    except Exception:
+                        answer = (
+                            f"Borrower: {parsed.get('borrower','Unknown')}. "
+                            f"Income: £{parsed.get('income','N/A')}. Loan: £{parsed.get('loan_amount','N/A')}. "
+                            f"LTV: {metrics.get('ltv','N/A')}, DSCR: {metrics.get('dscr','N/A')}."
+                        )
+                elif ("suit" in qlow or "suitable" in qlow) and "bridge" in qlow:
+                    term_ok = parsed.get("term_months") is not None and parsed.get("term_months") <= 24
+                    ltv_ok = metrics.get("ltv") is not None and metrics.get("ltv") <= 0.75
+                    dscr_ok = metrics.get("dscr") is None or metrics.get("dscr") >= 1.0
+                    ok = term_ok and ltv_ok and dscr_ok
+                    reasons = []
+                    if not term_ok:
+                        reasons.append(f"term months = {parsed.get('term_months')}")
+                    if not ltv_ok:
+                        reasons.append(f"ltv = {metrics.get('ltv')}")
+                    if not dscr_ok:
+                        reasons.append(f"dscr = {metrics.get('dscr')}")
+                    answer = "Suitable for typical bridging: " + ("Yes" if ok else "No") + ("" if ok else f". Issues: {', '.join(reasons)}")
+                else:
+                    # fall back to pipeline Q&A or summarizer QA
+                    proc_pdf, proc_data = load_pipeline()
                     if proc_data:
-                        answer = proc_data(parsed, ask=question)
+                        try:
+                            answer = proc_data(parsed, ask=question)
+                        except Exception as e:
+                            print("Q&A pipeline error:", e)
+                            _, answer_question = load_summarizer()
+                            try:
+                                answer = answer_question(parsed, question)
+                            except Exception as e2:
+                                answer = f"LLM_ERROR: {e2}"
                     else:
                         _, answer_question = load_summarizer()
-                        answer = answer_question(parsed, question)
-                except Exception as e:
-                    answer = f"LLM_ERROR: {e}"
+                        try:
+                            answer = answer_question(parsed, question)
+                        except Exception as e:
+                            answer = f"LLM_ERROR: {e}"
                 st.session_state["qa_answer"] = answer
 
     if st.session_state.get("qa_answer"):

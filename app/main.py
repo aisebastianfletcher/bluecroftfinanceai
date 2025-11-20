@@ -5,6 +5,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import glob
 import streamlit as st
 from pipeline.pipeline import process_pdf, process_data
 from app.pdf_form import create_pdf_from_dict
@@ -15,11 +16,22 @@ st.set_page_config(page_title="AI Lending Assistant", layout="wide")
 
 st.title("AI Lending Assistant — Bluecroft Demo")
 
+# Persist generated/uploaded PDF paths across reruns
+if "generated_pdf" not in st.session_state:
+    st.session_state["generated_pdf"] = None
+if "uploaded_pdf" not in st.session_state:
+    st.session_state["uploaded_pdf"] = None
+
+# Helper to list generated PDFs
+def list_generated_pdfs():
+    out_dir = os.path.join("output", "generated_pdfs")
+    os.makedirs(out_dir, exist_ok=True)
+    files = sorted(glob.glob(os.path.join(out_dir, "*.pdf")), key=os.path.getmtime, reverse=True)
+    # return basenames for nicer selectbox labels
+    return [os.path.basename(f) for f in files]
+
 # Use tabs to present Form vs Upload paths
 tab_form, tab_upload = st.tabs(["Fill Form (generate PDF)", "Upload PDF"])
-
-generated_pdf_path = None
-uploaded_pdf_path = None
 
 with tab_form:
     st.markdown("Fill the fields below and click Generate PDF to create an application PDF.")
@@ -46,16 +58,17 @@ with tab_form:
             "term_months": int(term_months),
             "notes": notes,
         }
-        generated_pdf_path = create_pdf_from_dict(data)
-        st.success(f"PDF generated: {generated_pdf_path}")
-        # provide download button for convenience
+        generated_path = create_pdf_from_dict(data)
+        st.session_state["generated_pdf"] = generated_path
+        st.success(f"PDF generated: {generated_path}")
+        # provide download button
         try:
-            with open(generated_pdf_path, "rb") as f:
+            with open(generated_path, "rb") as f:
                 pdf_bytes = f.read()
             st.download_button(
                 label="Download generated PDF",
                 data=pdf_bytes,
-                file_name=os.path.basename(generated_pdf_path),
+                file_name=os.path.basename(generated_path),
                 mime="application/pdf",
             )
         except Exception as e:
@@ -65,37 +78,62 @@ with tab_upload:
     st.markdown("Upload an existing application or statement PDF for analysis.")
     uploaded = st.file_uploader("Upload application / statement PDF", type=["pdf"], accept_multiple_files=False, key="upload1")
     if uploaded:
-        uploaded_pdf_path = save_uploaded_file(uploaded)
-        st.success(f"Saved uploaded file to {uploaded_pdf_path}")
-        # allow download back or quick preview action
+        uploaded_path = save_uploaded_file(uploaded)
+        st.session_state["uploaded_pdf"] = uploaded_path
+        st.success(f"Saved uploaded file to {uploaded_path}")
+        # allow download back
         try:
-            with open(uploaded_pdf_path, "rb") as f:
+            with open(uploaded_path, "rb") as f:
                 up_bytes = f.read()
             st.download_button(
                 label="Download uploaded PDF",
                 data=up_bytes,
-                file_name=os.path.basename(uploaded_pdf_path),
+                file_name=os.path.basename(uploaded_path),
                 mime="application/pdf",
             )
         except Exception as e:
             st.warning(f"Couldn't offer a download (server filesystem may be restricted): {e}")
 
-# Choose which PDF to analyse (priority: uploaded -> generated -> none)
+# Selection area for which PDF to analyse
 st.markdown("---")
 st.header("Analyse a PDF with AI")
-source_choice = st.radio("Select PDF source to analyse", options=["Use uploaded PDF", "Use generated PDF"], index=0)
 
-tmp_file = None
-if source_choice == "Use uploaded PDF":
-    if uploaded_pdf_path:
-        tmp_file = uploaded_pdf_path
-    else:
-        st.warning("No PDF was uploaded. Switch to 'Use generated PDF' or upload a PDF above.")
+generated_list = list_generated_pdfs()
+
+# Build options and default selection
+options = []
+if st.session_state.get("uploaded_pdf"):
+    options.append("Uploaded PDF")
+if st.session_state.get("generated_pdf"):
+    options.append("Most recent generated PDF")
+if generated_list:
+    options.append("Choose from generated files")
+
+if not options:
+    st.info("No PDFs available. Please upload a PDF or generate one using the tabs above.")
+    tmp_file = None
 else:
-    if generated_pdf_path:
-        tmp_file = generated_pdf_path
-    else:
-        st.info("No PDF was generated in this session yet. Use the 'Fill Form' tab to create one.")
+    choice = st.radio("Select source to analyse", options=options, index=0)
+
+    tmp_file = None
+    if choice == "Uploaded PDF":
+        tmp_file = st.session_state.get("uploaded_pdf")
+    elif choice == "Most recent generated PDF":
+        tmp_file = st.session_state.get("generated_pdf")
+    elif choice == "Choose from generated files":
+        # show selectbox with all generated files
+        sel = st.selectbox("Select generated file", options=generated_list, index=0)
+        tmp_file = os.path.join("output", "generated_pdfs", sel)
+
+# Quick preview (download) of selected file
+if tmp_file:
+    st.markdown(f"**Selected file:** {os.path.basename(tmp_file)}")
+    try:
+        with open(tmp_file, "rb") as f:
+            btn_bytes = f.read()
+        st.download_button(label="Download selected PDF", data=btn_bytes, file_name=os.path.basename(tmp_file), mime="application/pdf")
+    except Exception:
+        st.warning("Could not open the selected file for preview/download.")
 
 if st.button("Analyse With AI"):
     if tmp_file is None:

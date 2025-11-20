@@ -1,13 +1,16 @@
+# Ensure repo root is on sys.path so top-level modules (pipeline, utils) import correctly when running Streamlit
 import os
+import sys
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 import streamlit as st
 from pipeline.pipeline import process_pdf, process_data
 from app.pdf_form import create_pdf_from_dict
 from app.upload_handler import save_uploaded_file
 from utils.file_utils import save_json
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
 st.set_page_config(page_title="AI Lending Assistant", layout="wide")
 
 st.title("AI Lending Assistant — Bluecroft Demo")

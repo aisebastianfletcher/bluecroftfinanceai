@@ -16,6 +16,24 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import streamlit as st
+# load custom styles (app/static/styles.css) safely AFTER streamlit is available
+from pathlib import Path
+_css_path = Path(__file__).parent / "static" / "styles.css"
+if _css_path.exists():
+    try:
+        _css_text = _css_path.read_text(encoding="utf-8")
+        st.markdown(f"<style>{_css_text}</style>", unsafe_allow_html=True)
+    except Exception:
+        pass
+# optional: minimal inline fallback so header/background still looks okay even if file missing
+else:
+    st.markdown(
+        "<style>"
+        ".bf-header { background: linear-gradient(90deg,#003366,#0078D4); color:white; padding:12px 18px; border-radius:8px; }"
+        ".stApp { background: linear-gradient(180deg,#eaf2ff,#ffffff); }"
+        "</style>",
+        unsafe_allow_html=True,
+    )
 import pandas as pd
 import altair as alt
 

@@ -4,7 +4,15 @@ import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-
+# load custom styles (app/static/styles.css)
+from pathlib import Path
+_css_path = Path(__file__).parent / "static" / "styles.css"
+try:
+    _css_text = _css_path.read_text(encoding="utf-8")
+    st.markdown(f"<style>{_css_text}</style>", unsafe_allow_html=True)
+except Exception as _e:
+    # if the file isn't present, fall back silently
+    st.warning("Custom style not loaded (app/static/styles.css not found).")
 import glob
 import math
 import streamlit as st

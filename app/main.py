@@ -1,5 +1,5 @@
 # app/main.py
-# Updated main.py with safe Plotly image export (uses app.plotly_utils.safe_write_plotly_image)
+# Updated: only header/title text changed to "Blue Croft Finance" (keeps all layout and behaviour unchanged)
 from __future__ import annotations
 import os
 import sys
@@ -58,7 +58,7 @@ except Exception:
             except Exception:
                 return None
 
-st.set_page_config(page_title="Bluecroft Finance", layout="wide")
+st.set_page_config(page_title="Blue Croft Finance", layout="wide")
 
 # Styling and setup (kept identical to prior layout)
 st.markdown(
@@ -79,7 +79,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown(f'<div class="app-header"><div class="app-title">Bluecroft Finance</div><div class="app-sub">Bridging loan calculator & underwriting report</div></div>', unsafe_allow_html=True)
+# === TITLE CHANGE ===
+# Display the title exactly as requested: "Blue Croft Finance"
+st.markdown(f'<div class="app-header"><div class="app-title">Blue Croft Finance</div><div class="app-sub">Bridging loan calculator & underwriting report</div></div>', unsafe_allow_html=True)
 
 # Ensure output dirs
 os.makedirs(ROOT / "output" / "generated_pdfs", exist_ok=True)
@@ -391,4 +393,4 @@ with right:
             buf.seek(0)
             st.download_button("Download JSON report", data=buf, file_name="underwriting_report.json", mime="application/json")
 
-st.markdown("<div style='text-align:center; color:#556; margin-top:18px;'>Bluecroft Finance &middot; Underwriting assistant</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center; color:#556; margin-top:18px;'>Blue Croft Finance &middot; Underwriting assistant</div>", unsafe_allow_html=True)

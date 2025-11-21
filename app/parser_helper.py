@@ -1,43 +1,15 @@
-# app/parse_helpers.py
-# Helper to extract embedded key:value pairs from text fields and detect implausible loan amounts.
+"""
+app/parse_helpers.py
+
+Helpers to extract embedded machine-readable key:value pairs from textual fields
+and to detect implausible loan amounts.
+"""
 import re
 from typing import Dict, Any, Tuple, List
-
-ALIAS_TO_CANONICAL = {
-    "project_cost": ["project_cost", "project cost", "total_project_cost", "total project cost", "total_cost"],
-    "total_cost": ["total_cost", "total cost", "totalprojectcost"],
-    "interest_rate_annual": ["interest_rate_annual", "interest rate (annual)", "interest_rate", "interest rate", "rate", "annual_rate"],
-    "loan_term_months": ["loan_term_months", "loan term months", "term_months", "term", "loan_term", "loan term"],
-    "term_months": ["term_months", "term", "loan_term_months"],
-    "loan_amount": ["loan_amount", "loan", "requested_loan", "amount_requested"],
-    "property_value": ["property_value", "property value", "property_value_estimate", "property"],
-    "income": ["income", "annual_income"],
-    "borrower": ["borrower", "applicant", "name"],
-    "arv": ["arv", "after_repair_value"],
-    "purchase_price": ["purchase_price", "purchase price"],
-    "refurbishment_budget": ["refurbishment_budget", "refurb budget", "refurbishment"],
-    "dscr": ["dscr"],
-    "monthly_rent": ["monthly_rent", "monthly rent", "rent_monthly"],
-    "operating_costs": ["operating_costs", "operating costs", "operating_expenses"],
-}
-
-_variant_to_canonical = {}
-for canon, variants in ALIAS_TO_CANONICAL.items():
-    for v in variants:
-        _variant_to_canonical[v.lower().replace("_", " ").replace("-", " ")] = canon
 
 _num_rx = re.compile(r'(-?\d[\d,\.]*)')
 _kv_rx = re.compile(r'(?:["\']?\b([A-Za-z0-9_ \(\)\-]+?)["\']?\s*[:=]\s*(?:["\']?([^\n\r,,{}]+?)["\']?))', re.I)
 _json_kv_rx = re.compile(r'"([^"]+)"\s*:\s*(".*?"|[0-9.\-]+)', re.I)
-
-def _normalize_key_label(label: str) -> str:
-    if not label:
-        return ""
-    n = label.strip().lower().replace("_", " ").replace("-", " ")
-    for variant, canon in _variant_to_canonical.items():
-        if variant in n or n in variant:
-            return canon
-    return re.sub(r'[^\w]', '_', label.strip()).lower()
 
 def _to_number(s: str):
     if s is None:
@@ -69,10 +41,15 @@ def _to_number(s: str):
                 return s.strip()
     return s.strip()
 
+def _normalize_key_label(label: str) -> str:
+    if not label:
+        return ""
+    return re.sub(r'[^\w]', '_', label.strip()).lower()
+
 def extract_embedded_kv(parsed: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     if parsed is None:
         return parsed, []
-    extracted_keys: List[str] = []
+    extracted: List[str] = []
     for k, v in list(parsed.items()):
         if not isinstance(v, str):
             continue
@@ -84,7 +61,7 @@ def extract_embedded_kv(parsed: Dict[str, Any]) -> Tuple[Dict[str, Any], List[st
             val = _to_number(val_raw)
             if canon and parsed.get(canon) in (None, "", parsed.get(canon)):
                 parsed[canon] = val
-                extracted_keys.append(canon)
+                extracted.append(canon)
         for m in _kv_rx.finditer(txt):
             key_raw = m.group(1)
             val_raw = m.group(2)
@@ -92,18 +69,9 @@ def extract_embedded_kv(parsed: Dict[str, Any]) -> Tuple[Dict[str, Any], List[st
             val = _to_number(val_raw)
             if canon and parsed.get(canon) in (None, "", parsed.get(canon)):
                 parsed[canon] = val
-                extracted_keys.append(canon)
-        inline_rx = re.finditer(r'([A-Za-z0-9_ \(\)\-]+?)\s*:\s*([0-9,\.\-]+)', txt)
-        for m in inline_rx:
-            key_raw = m.group(1)
-            val_raw = m.group(2)
-            canon = _normalize_key_label(key_raw)
-            val = _to_number(val_raw)
-            if canon and parsed.get(canon) in (None, "", parsed.get(canon)):
-                parsed[canon] = val
-                extracted_keys.append(canon)
-    extracted_keys = list(dict.fromkeys(extracted_keys))
-    return parsed, extracted_keys
+                extracted.append(canon)
+    extracted = list(dict.fromkeys(extracted))
+    return parsed, extracted
 
 def detect_implausible_loan(parsed: Dict[str, Any]) -> bool:
     try:

@@ -1,27 +1,38 @@
 """
-Robust lending metrics helpers with aliases, normalization and swap/scale detection.
+Robust lending metrics helpers with input auditing.
 
-Drop this file in app/metrics.py to replace the previous metrics implementation.
-
-What changed (high level)
-- Normalises input keys (accepts many label variants and maps them to the exact machine-readable keys)
-- Coerces string values like "£330,000" or "330,000" into floats
-- Detects obviously-suspicious LTV values (very large numbers) and attempts *safe* fixes:
-  - scaling property_value by 1,000 if it appears to be provided in 'k' units or missing trailing zeros
-  - emits an input_audit message when auto-corrections are attempted
-- Preserves detailed input_audit entries so the UI shows why values were missing or what auto-fixes were applied
-- Computes amortising and interest-only payments, annual debt service and DSCRs
-- Always returns decimals for ratios (ltv == 0.75 means 75%)
-
-This file focuses on defensive handling so the app returns meaningful numbers instead of NULLs
-when the upstream parsed JSON uses slightly different labels or common formatting quirks.
+Drop into app/metrics.py and import:
+from app.metrics import compute_lending_metrics, amortization_schedule
 """
 from typing import Optional, Dict, Any, List, Tuple
 import math
 import re
 import pandas as pd
 
-# canonical keys we use throughout
+def _to_float_safe(v: Optional[Any]) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        try:
+            return float(v)
+        except Exception:
+            return None
+    s = str(v).strip()
+    if s == "":
+        return None
+    s = s.replace("\u00A0", "").replace(",", "").replace("£", "").replace("$", "").strip()
+    s = s.replace("%", "")
+    try:
+        return float(s)
+    except Exception:
+        m = re.search(r"-?\d+(\.\d+)?", s)
+        if m:
+            try:
+                return float(m.group(0))
+            except Exception:
+                return None
+        return None
+
 CANONICAL_KEYS = {
     "loan_amount": ["loan_amount", "loan", "requested_loan", "amount_requested"],
     "property_value": ["property_value", "property_value_estimate", "property", "value_of_property"],
@@ -35,7 +46,6 @@ CANONICAL_KEYS = {
     "operating_expenses": ["operating_costs", "operating_costs", "operating_expenses", "annual_expenses"],
     "policy_flags": ["policy_flags", "flags"],
     "bank_red_flags": ["bank_red_flags", "bank_flags", "red_flags"],
-    # additional optional keys passed through if present
     "borrower": ["borrower", "applicant", "name"],
     "arv": ["arv", "after_repair_value"],
     "purchase_price": ["purchase_price"],
@@ -44,42 +54,9 @@ CANONICAL_KEYS = {
     "dscr": ["dscr"]
 }
 
-
-def _to_float_safe(v: Optional[Any]) -> Optional[float]:
-    """Convert many common numeric string formats to float; return None if invalid."""
-    if v is None:
-        return None
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        try:
-            return float(v)
-        except Exception:
-            return None
-    s = str(v).strip()
-    if s == "":
-        return None
-    # remove currency signs and commas and non-breaking spaces
-    s = s.replace("\u00A0", "").replace(",", "").replace("£", "").replace("$", "").strip()
-    # sometimes percent sign or trailing % (we allow percent for rates upstream, but not here)
-    s = s.replace("%", "")
-    # if still numeric-ish
-    try:
-        return float(s)
-    except Exception:
-        # fallback: extract first numeric substring
-        m = re.search(r"-?\d+(\.\d+)?", s)
-        if m:
-            try:
-                return float(m.group(0))
-            except Exception:
-                return None
-        return None
-
-
 def _find_by_alias(parsed: Dict[str, Any], aliases: List[str]) -> Optional[Any]:
-    """Search parsed dict for any of the aliases (case-insensitive, punctuation tolerant)."""
     if not parsed:
         return None
-    # create a mapping of normalized key -> actual key
     norm_map = {}
     for k in parsed.keys():
         if k is None:
@@ -90,7 +67,6 @@ def _find_by_alias(parsed: Dict[str, Any], aliases: List[str]) -> Optional[Any]:
         an = re.sub(r"[^\w]", "", str(a).lower())
         if an in norm_map:
             return parsed.get(norm_map[an])
-    # if no exact normalized key found, try substring match on original keys
     for k in parsed.keys():
         kl = str(k).lower()
         for a in aliases:
@@ -98,44 +74,24 @@ def _find_by_alias(parsed: Dict[str, Any], aliases: List[str]) -> Optional[Any]:
                 return parsed.get(k)
     return None
 
-
 def _canonicalize(parsed: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Build a new dict 'p' that contains only the canonical keys and normalized numeric values where relevant.
-    Returns (p, audit).
-    """
     p: Dict[str, Any] = {}
     audit: List[str] = []
-
-    # copy-through helper for optional passthrough keys
     for canon, aliases in CANONICAL_KEYS.items():
         val = _find_by_alias(parsed, aliases)
         if canon in ("loan_amount", "property_value", "project_cost", "total_cost",
-                     "interest_rate_annual", "term_months", "income", "noi", "annual_rent", "operating_expenses",
-                     "monthly_rent", "dscr", "arv", "purchase_price", "refurbishment_budget"):
-            # numeric expected
+                     "interest_rate_annual", "term_months", "income", "noi", "annual_rent",
+                     "operating_expenses", "monthly_rent", "dscr", "arv", "purchase_price", "refurbishment_budget"):
             num = _to_float_safe(val)
             if num is None and val is not None:
-                # present but couldn't parse
                 audit.append(f"Field '{canon}' found but could not parse numeric value: '{val}'")
             p[canon] = num
         else:
-            # strings or lists (policy flags etc.)
-            if val is None:
-                p[canon] = None
-            else:
-                p[canon] = val
-
-    # Keep original parsed copy for transparency
+            p[canon] = val
     p["_raw_parsed"] = parsed
     return p, audit
 
-
 def amortization_schedule(loan_amount: float, annual_rate_decimal: float, term_months: int) -> pd.DataFrame:
-    """
-    Accurate amortization schedule (monthly).
-    annual_rate_decimal is decimal (e.g., 0.055 for 5.5%).
-    """
     P = float(loan_amount)
     n = int(term_months)
     if n <= 0:
@@ -165,13 +121,7 @@ def amortization_schedule(loan_amount: float, annual_rate_decimal: float, term_m
         })
     return pd.DataFrame(rows)
 
-
 def _attempt_property_scaling(loan: float, prop: float) -> Tuple[float, str]:
-    """
-    Attempt to scale property value if it appears to be in thousands (k) or missing zeros.
-    Returns (new_prop, message) where message is empty if no change.
-    Heuristic: if prop < 1000 and loan/(prop*1000) is plausible (0.2..10), scale by 1000.
-    """
     if prop is None or loan is None:
         return prop, ""
     msg = ""
@@ -182,7 +132,6 @@ def _attempt_property_scaling(loan: float, prop: float) -> Tuple[float, str]:
             if ltv_scaled is not None and 0.05 <= ltv_scaled <= 10.0:
                 msg = f"Scaled property_value by x1000 (was {prop}, now {scaled}) because original value was small and produced implausible LTV."
                 return scaled, msg
-        # also try scaling by 100 if prop small but scaling by 100 yields plausible ltv
         if prop > 0 and prop < 10000:
             scaled2 = prop * 100.0
             ltv_scaled2 = loan / scaled2 if scaled2 else None
@@ -193,23 +142,15 @@ def _attempt_property_scaling(loan: float, prop: float) -> Tuple[float, str]:
         pass
     return prop, ""
 
-
 def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Main entry. Accepts the raw parsed dict. Returns lending_metrics and also writes parsed['input_audit'].
-    """
     if parsed is None:
         parsed = {}
-
     p, audit = _canonicalize(parsed)
-
     loan = p.get("loan_amount")
     prop = p.get("property_value")
     project_cost = p.get("project_cost") or p.get("total_cost")
     rate = p.get("interest_rate_annual")
     term_months = p.get("term_months")
-
-    # Defensive checks and attempted auto-fixes for common mistakes
     if loan is None:
         audit.append("Missing or invalid loan_amount")
     if prop is None:
@@ -220,13 +161,10 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
         audit.append("Interest rate not provided or invalid")
     if term_months is None:
         audit.append("Loan term (months) not provided or invalid")
-
-    # If property value seems tiny relative to loan try scaling heuristics
     if loan is not None and prop is not None:
         try:
             ltv_raw = loan / prop if prop else None
             if ltv_raw is not None and ltv_raw > 10:
-                # suspicious: try scaling the property value
                 new_prop, msg = _attempt_property_scaling(loan, prop)
                 if msg:
                     audit.append(msg)
@@ -234,36 +172,26 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
                     p["property_value"] = prop
         except Exception:
             pass
-
-    # If property >> loan by orders of magnitude, check swap (rare) and warn
     if loan is not None and prop is not None:
         try:
             if prop > 0 and (prop / loan) > 1000:
                 audit.append("Property value is orders of magnitude larger than loan — please verify fields were not swapped.")
         except Exception:
             pass
-
-    # Now compute metrics using corrected/normalized values in p
     lm: Dict[str, Any] = {}
-    lm["input_audit_notes"] = list(audit)  # keep original audit messages as a field
-
-    # LTV and LTC
+    lm["input_audit_notes"] = list(audit)
     ltv = None
     if loan is not None and prop is not None and prop > 0:
         ltv = loan / prop
     lm["ltv"] = round(ltv, 4) if isinstance(ltv, float) else None
-
     ltc = None
     if loan is not None and project_cost is not None and project_cost > 0:
         ltc = loan / project_cost
     lm["ltc"] = round(ltc, 4) if isinstance(ltc, float) else None
-
-    # Amortisation (amortising payment & schedule) if rate & term provided
     amort_df = None
     monthly_amort = None
     total_interest = None
     if loan is not None and rate is not None and term_months:
-        # ensure rate is decimal (allow percent input >1)
         r = rate
         if r > 1:
             r = r / 100.0
@@ -274,8 +202,6 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             audit.append(f"Failed to build amortization schedule: {e}")
             amort_df = None
-
-    # Fallback amortising calc if schedule not built but components present
     if monthly_amort is None and loan is not None and rate is not None and term_months:
         try:
             r = rate
@@ -290,8 +216,6 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             audit.append(f"Fallback amortising calc failed: {e}")
             monthly_amort = None
-
-    # Interest-only (bridging)
     monthly_io = None
     if loan is not None and rate is not None:
         try:
@@ -302,15 +226,11 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             audit.append(f"Failed to compute interest-only payment: {e}")
             monthly_io = None
-
     lm["monthly_amortising_payment"] = round(monthly_amort, 2) if isinstance(monthly_amort, (int, float)) else None
     lm["monthly_interest_only_payment"] = round(monthly_io, 2) if isinstance(monthly_io, (int, float)) else None
     lm["total_interest"] = round(total_interest, 2) if isinstance(total_interest, (int, float)) else None
-
     lm["annual_debt_service_amortising"] = round(lm["monthly_amortising_payment"] * 12.0, 2) if lm.get("monthly_amortising_payment") else None
     lm["annual_debt_service_io"] = round(lm["monthly_interest_only_payment"] * 12.0, 2) if lm.get("monthly_interest_only_payment") else None
-
-    # NOI detection / proxy from income (30% of income) if not provided
     noi = p.get("noi")
     if noi is None:
         annual_rent = p.get("annual_rent")
@@ -329,8 +249,6 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 noi = None
     lm["noi"] = round(noi, 2) if isinstance(noi, (int, float)) else None
-
-    # DSCRs for amortising and IO
     dscr_amort = None
     dscr_io = None
     try:
@@ -346,14 +264,10 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
         dscr_io = None
     lm["dscr_amortising"] = round(dscr_amort, 3) if isinstance(dscr_amort, (int, float)) else None
     lm["dscr_interest_only"] = round(dscr_io, 3) if isinstance(dscr_io, (int, float)) else None
-
-    # Flags passthrough
     policy_flags = parsed.get("policy_flags") or parsed.get("flags") or []
     bank_red_flags = parsed.get("bank_red_flags") or []
     lm["policy_flags"] = policy_flags
     lm["bank_red_flags"] = bank_red_flags
-
-    # Risk scoring using LTV + DSCR (amortising preferred) + flags
     ltv_risk = 0.0
     if lm.get("ltv") is not None:
         v = lm["ltv"]
@@ -363,7 +277,6 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
             ltv_risk = 0.5
         else:
             ltv_risk = 1.0
-
     dscr_for_score = lm.get("dscr_amortising") if lm.get("dscr_amortising") is not None else lm.get("dscr_interest_only")
     dscr_risk = 1.0
     if dscr_for_score is not None:
@@ -374,15 +287,11 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
             dscr_risk = 0.5
         else:
             dscr_risk = 1.0
-
     flags_risk = 1.0 if (policy_flags or bank_red_flags) else 0.0
-
     risk_score = (0.5 * ltv_risk) + (0.35 * dscr_risk) + (0.15 * flags_risk)
     risk_score = min(max(risk_score, 0.0), 1.0)
     lm["risk_score_computed"] = round(risk_score, 3)
     lm["risk_category"] = "High" if risk_score >= 0.7 else ("Medium" if risk_score >= 0.4 else "Low")
-
-    # reasons / explainability
     reasons: List[str] = []
     if lm.get("ltv") is not None:
         if lm["ltv"] >= 0.85:
@@ -398,8 +307,6 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
     if not reasons:
         reasons.append("No automated flags detected")
     lm["risk_reasons"] = reasons
-
-    # amortization preview
     if amort_df is not None:
         try:
             lm["amortization_preview_rows"] = amort_df.head(12).to_dict(orient="records")
@@ -410,8 +317,6 @@ def compute_lending_metrics(parsed: Dict[str, Any]) -> Dict[str, Any]:
     else:
         lm["amortization_preview_rows"] = None
         lm["amortization_total_interest"] = None
-
-    # record the audit messages for UI consumption and return
     parsed["input_audit"] = audit
     parsed["lending_metrics"] = lm
     return lm

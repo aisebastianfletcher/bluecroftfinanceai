@@ -1,11 +1,11 @@
 """
 Blue Croft Finance — Streamlit app entrypoint (app/main.py)
 
-This file is the main Streamlit UI for the Blue Croft Finance underwriting assistant.
-I kept the defensive imports and helpers but updated the visible title to exactly:
-    blue croft finance
-
-Drop this file into app/main.py (overwrite existing) and restart Streamlit.
+Updated to:
+- show a clear "Analyse With AI" button
+- produce a professional, resume-style full report (HTML, not monospace/code-style)
+- keep defensive imports for optional helpers (metrics, parse_helpers, pdf generator)
+- extract embedded machine fields, normalize, prompt fixes, compute metrics, then render full report
 """
 from __future__ import annotations
 import os
@@ -25,14 +25,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Try to import app.metrics (robust metrics). Fallback to a minimal no-op if missing.
+# Defensive imports: metrics, parse helpers, pdf generator, summarizer
 try:
     from app.metrics import compute_lending_metrics, amortization_schedule  # type: ignore
 except Exception:
     compute_lending_metrics = None
     amortization_schedule = None
 
-# Try to import parse helpers. Provide no-op fallbacks if missing to avoid crashing.
 try:
     from app.parse_helpers import extract_embedded_kv, detect_implausible_loan  # type: ignore
 except Exception:
@@ -41,43 +40,65 @@ except Exception:
     def detect_implausible_loan(parsed: dict) -> bool:
         return False
 
-# Optional PDF generator helper
 try:
     from app.pdf_form import create_pdf_from_dict  # type: ignore
 except Exception:
     create_pdf_from_dict = None
 
+# Optional LLM summarizer (non-fatal)
+try:
+    from pipeline.llm.summarizer import generate_summary, answer_question  # type: ignore
+except Exception:
+    def generate_summary(parsed: dict) -> str:
+        lm = parsed.get("lending_metrics", {}) or {}
+        borrower = parsed.get("borrower") or "Unknown"
+        ltv = lm.get("ltv")
+        ltv_str = f"{ltv*100:.1f}%" if isinstance(ltv, (int, float)) else "N/A"
+        return f"{borrower} — LTV: {ltv_str}. Risk: {lm.get('risk_category','N/A')}."
+    def answer_question(parsed: dict, question: str) -> str:
+        return "LLM not configured. Provide OPENAI_API_KEY / summarizer for richer answers."
+
 st.set_page_config(page_title="blue croft finance", layout="wide")
 
-# Ensure output folders exist
+# ensure output directories exist
 os.makedirs(ROOT / "output" / "generated_pdfs", exist_ok=True)
 os.makedirs(ROOT / "output" / "uploaded_pdfs", exist_ok=True)
 os.makedirs(ROOT / "output" / "supporting_docs", exist_ok=True)
 
-# Minimal CSS to create a clean centered title and report box
+# Small CSS for resume-style output
 st.markdown(
     """
     <style>
     .bf-title {
         font-family: "Helvetica Neue", Arial, sans-serif;
-        font-size: 28px;
-        font-weight: 800;
-        color: #002a4e;
+        font-size: 34px;
+        font-weight: 900;
+        color: #072b4f;
         letter-spacing: 1px;
-        margin-bottom: 6px;
+        margin-bottom: 2px;
     }
-    .bf-sub {
-        color: #345;
-        margin-bottom: 18px;
+    .bf-sub { color: #274257; margin-bottom: 18px; font-size:14px; }
+    .resume {
+        font-family: "Georgia", "Times New Roman", serif;
+        color: #122;
+        background: #fff;
+        padding: 22px;
+        border-radius: 6px;
+        border: 1px solid #e6eef5;
+        max-width: 980px;
+        margin: 12px auto;
     }
-    .report-box { max-width:980px; margin-left:auto; margin-right:auto; background:rgba(255,255,255,0.98);
-      padding:18px; border-radius:10px; box-shadow:0 8px 24px rgba(10,30,60,0.06); border:1px solid rgba(15,40,80,0.04); }
+    .section-title { font-size:16px; font-weight:700; color:#07385e; margin-top:12px; margin-bottom:6px; }
+    .kv { display:flex; gap:12px; margin-bottom:6px; }
+    .kv .k { width:160px; color:#49606f; font-weight:700; }
+    .kv .v { color:#122; }
+    .bullet { margin:6px 0; color:#233; }
+    .small { color:#556; font-size:13px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# helper to center altair charts using a middle column
 def center_chart(chart_obj, use_container_width: bool = True, height: int | None = None):
     try:
         cols = st.columns([1, 10, 1])
@@ -106,22 +127,7 @@ def _norm_quiet(v):
     except Exception:
         return s
 
-def save_supporting_files(files: typing.Iterable[typing.Any], group_name: str) -> list:
-    out_dir = ROOT / "output" / "supporting_docs" / group_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for f in files:
-        try:
-            filename = Path(f.name).name
-            dest = out_dir / filename
-            with open(dest, "wb") as fh:
-                fh.write(f.getbuffer())
-            saved.append(str(dest))
-        except Exception:
-            continue
-    return saved
-
-# Initialize session state keys with JSON-serializable defaults
+# Session defaults
 for k, v in [
     ("generated_pdf", None),
     ("uploaded_pdf", None),
@@ -135,86 +141,46 @@ for k, v in [
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Page header (clean, centered-ish)
-st.markdown(f'<div style="text-align:center;"><div class="bf-title">blue croft finance</div><div class="bf-sub">AI underwriting assistant</div></div>', unsafe_allow_html=True)
+# Header
+st.markdown(f'<div style="text-align:center;"><div class="bf-title">blue croft finance</div><div class="bf-sub">AI underwriting assistant — underwriting report (resume style)</div></div>', unsafe_allow_html=True)
 
-# Input area: quick calculator, manual parsed, upload/generate PDF
-with st.expander("Quick Calculator (create parsed sample)"):
-    with st.form("quick_calc"):
-        qc1, qc2 = st.columns(2)
-        with qc1:
-            q_borrower = st.text_input("Borrower", "John Doe")
-            q_income = st.number_input("Annual income (GBP)", value=85000, step=1000)
-            q_loan = st.number_input("Loan amount (GBP)", value=200000, step=1000)
-        with qc2:
-            q_prop = st.number_input("Property value (GBP)", value=300000, step=1000)
-            q_rate = st.number_input("Interest rate (annual %)", value=9.5, step=0.1)
-            q_term_years = st.number_input("Term (years)", value=1, min_value=1, step=1)
-        submit_q = st.form_submit_button("Save sample parsed")
-    if submit_q:
-        parsed = {
-            "borrower": q_borrower,
-            "income": float(q_income),
-            "loan_amount": float(q_loan),
-            "property_value": float(q_prop),
-            "interest_rate_annual": float(q_rate),
-            "loan_term_months": int(q_term_years) * 12,
-            "term_months": int(q_term_years) * 12,
-        }
-        st.session_state["calc_result"] = parsed
-        st.success("Sample parsed saved to session (select 'Use quick calculator result' below).")
-
-with st.expander("Manual parsed JSON (paste pipeline output)"):
-    st.markdown("Paste raw parsed JSON or Python repr. The app will attempt to extract machine-readable key:value pairs embedded inside strings.")
-    manual_text = st.text_area("Raw parsed JSON / text", height=140)
-    if st.button("Save manual parsed"):
-        try:
-            manual_obj = json.loads(manual_text)
-        except Exception:
-            manual_obj = {"raw_text": manual_text}
-        st.session_state["manual_parsed_json"] = json.dumps(manual_obj)
-        st.success("Manual parsed saved.")
-
-with st.expander("Upload / Generate PDF"):
-    col_a, col_b = st.columns(2)
-    with col_a:
-        uploaded = st.file_uploader("Upload application PDF", type=["pdf"])
-        if uploaded:
-            dest_dir = ROOT / "output" / "uploaded_pdfs"
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / f"{int(time.time())}_{Path(uploaded.name).name}"
-            with open(dest, "wb") as fh:
-                fh.write(uploaded.getbuffer())
-            st.session_state["uploaded_pdf"] = str(dest)
-            st.success(f"Uploaded and saved: {dest}")
-    with col_b:
+# Inputs area (collapsed)
+with st.expander("Inputs & Actions", expanded=False):
+    cols = st.columns(2)
+    with cols[0]:
+        st.markdown("Quick sample (use to create a parsed sample):")
+        if st.button("Load sample parsed"):
+            s = {
+                "borrower": "John Doe",
+                "income": 85000,
+                "loan_amount": 200000,
+                "property_value": 300000,
+                "project_cost": 260000,
+                "total_cost": 260000,
+                "interest_rate_annual": 9.5,
+                "loan_term_months": 12,
+                "term_months": 12,
+            }
+            st.session_state["calc_result"] = s
+            st.success("Sample parsed loaded (select 'Use quick calculator result' below).")
+    with cols[1]:
+        st.markdown("Generate parser-friendly PDF (optional):")
         if create_pdf_from_dict:
-            with st.form("gen_pdf_form"):
-                g_borrower = st.text_input("Borrower (for generated PDF)", "John Doe")
-                g_income = st.text_input("Income", "85000")
-                g_loan = st.text_input("Loan amount", "200000")
-                g_property = st.text_input("Property value", "300000")
-                g_project_cost = st.text_input("project_cost", "260000")
-                g_total_cost = st.text_input("total_cost", "260000")
-                g_rate = st.text_input("interest_rate_annual", "9.5")
-                g_term = st.text_input("loan_term_months", "12")
-                gen_submit = st.form_submit_button("Generate parser-friendly PDF")
-            if gen_submit:
+            if st.button("Generate sample PDF"):
                 data = {
-                    "borrower": g_borrower,
-                    "income": _norm_quiet(g_income),
-                    "loan_amount": _norm_quiet(g_loan),
-                    "property_value": _norm_quiet(g_property),
-                    "project_cost": _norm_quiet(g_project_cost),
-                    "total_cost": _norm_quiet(g_total_cost),
-                    "interest_rate_annual": _norm_quiet(g_rate),
-                    "loan_term_months": _norm_quiet(g_term),
-                    "term_months": _norm_quiet(g_term),
+                    "project_cost": 260000,
+                    "total_cost": 260000,
+                    "interest_rate_annual": 9.5,
+                    "loan_term_months": 12,
+                    "borrower": "John Doe",
+                    "income": 85000,
+                    "loan_amount": 200000,
+                    "property_value": 300000
                 }
                 try:
                     path = create_pdf_from_dict(data)
                     st.session_state["generated_pdf"] = path
-                    st.success(f"PDF created: {path}")
+                    st.success(f"PDF generated: {path}")
                     with open(path, "rb") as fh:
                         st.download_button("Download generated PDF", data=fh.read(), file_name=Path(path).name, mime="application/pdf")
                 except Exception as e:
@@ -222,7 +188,7 @@ with st.expander("Upload / Generate PDF"):
 
 st.markdown("---")
 
-# Selection of source for analysis
+# Selection source
 options = []
 if st.session_state.get("uploaded_pdf"):
     options.append("Uploaded PDF")
@@ -237,8 +203,8 @@ if not options:
 
 choice = st.selectbox("Choose source to analyse", options=options, index=0)
 
-# Build parsed dict from selection
-parsed: dict = {}
+# Prepare parsed dict from choice
+parsed = {}
 if choice == "Uploaded PDF":
     pdf_path = st.session_state.get("uploaded_pdf")
     parsed = {}
@@ -247,7 +213,7 @@ if choice == "Uploaded PDF":
         parsed = process_pdf(pdf_path) or {}
     except Exception:
         parsed = {}
-        st.info("No pipeline available to auto-extract from PDF; use manual entry or quick calculator.")
+        st.info("No pipeline available to auto-extract from PDF; use manual parsed or quick calculator.")
 elif choice == "Most recent generated PDF":
     gen = st.session_state.get("generated_pdf")
     if gen:
@@ -267,27 +233,23 @@ elif choice == "Use manual parsed values":
 else:
     parsed = {}
 
-# Show raw parsed for debugging
-st.markdown("### Raw parsed (diagnostic)")
-st.write(parsed)
+# Raw parsed diagnostic (collapsible)
+with st.expander("Raw parsed (diagnostic)"):
+    st.write(parsed)
 
-# Extract embedded key:value pairs from string fields
+# Extract embedded machine fields if any
 parsed, extracted = extract_embedded_kv(parsed)
 if extracted:
-    st.info(f"Extracted machine fields from text: {', '.join(extracted)}")
-    st.write("Parsed after extraction:", parsed)
+    st.info(f"Extracted fields: {', '.join(extracted)}")
 
-# Gentle normalisation of numeric fields
+# Gentle normalization
 for k in ("loan_amount", "property_value", "project_cost", "total_cost", "interest_rate_annual", "loan_term_months", "term_months", "income"):
     if k in parsed and parsed.get(k) is not None:
         parsed[k] = _norm_quiet(parsed.get(k))
 
-st.markdown("### Normalised parsed (diagnostic)")
-st.write(parsed)
-
-# If implausible loan, prompt quick fix
+# Detect implausible loan and let user fix
 if detect_implausible_loan(parsed):
-    st.warning("Detected implausible/suspicious loan amount relative to property/project. Please confirm or fix.")
+    st.warning("Detected an implausible/suspicious loan amount relative to property/project. Please confirm or fix below.")
     with st.form("fix_loan_amount"):
         s1 = parsed.get("project_cost")
         s2 = parsed.get("total_cost") or s1
@@ -312,112 +274,162 @@ if detect_implausible_loan(parsed):
         else:
             st.warning("No valid fix applied. Please enter a manual positive value.")
 
-# Compute lending metrics (if metrics module present)
-if compute_lending_metrics:
-    try:
-        lm = compute_lending_metrics(parsed)
-    except Exception as e:
-        st.error("Metrics computation failed: " + str(e))
+# MAIN ANALYSIS BUTTON
+if st.button("Analyse With AI"):
+    # compute metrics first
+    if compute_lending_metrics:
+        try:
+            lm = compute_lending_metrics(parsed)
+        except Exception as e:
+            st.error("Metrics computation failed: " + str(e))
+            lm = parsed.get("lending_metrics") or {}
+    else:
+        st.warning("Metrics module unavailable; install app/metrics.py for full computation.")
         lm = parsed.get("lending_metrics") or {}
-else:
-    st.warning("Metrics module not installed (app/metrics.py missing). Computation skipped.")
-    lm = parsed.get("lending_metrics") or {}
 
-# Persist last analysis (JSON-serializable)
-try:
-    st.session_state["last_analysis"] = parsed
-except Exception:
+    # persist last analysis
     try:
-        st.session_state["last_analysis"] = json.loads(json.dumps(parsed, default=str))
+        st.session_state["last_analysis"] = parsed
     except Exception:
-        st.session_state["last_analysis"] = {}
+        st.session_state["last_analysis"] = json.loads(json.dumps(parsed, default=str))
 
-# Show audits/notes
-audit = parsed.get("input_audit") or []
-if isinstance(audit, list) and audit:
-    st.warning("Input audit: " + "; ".join(audit))
-notes = lm.get("input_audit_notes") if isinstance(lm, dict) else None
-if notes:
-    st.info("Normalization notes: " + "; ".join(notes))
+    # show audits if any
+    audit = parsed.get("input_audit") or lm.get("input_audit_notes") or []
+    if audit:
+        st.warning("Input audit: " + "; ".join(audit))
 
-# Display metrics
-st.subheader("Computed lending metrics")
-st.json(lm)
+    # produce professional resume-style full report (HTML)
+    def render_resume_report(parsed: dict, lm: dict) -> str:
+        borrower = parsed.get("borrower", "N/A")
+        income = parsed.get("income", "N/A")
+        loan_amount = parsed.get("loan_amount", "N/A")
+        property_value = parsed.get("property_value", "N/A")
+        project_cost = parsed.get("project_cost", parsed.get("total_cost", "N/A"))
+        rate = parsed.get("interest_rate_annual", "N/A")
+        term = parsed.get("loan_term_months", parsed.get("term_months", "N/A"))
+        ltv = lm.get("ltv")
+        ltv_str = f"{ltv*100:.1f}%" if isinstance(ltv, (int, float)) else "N/A"
+        monthly_am = lm.get("monthly_amortising_payment")
+        monthly_io = lm.get("monthly_interest_only_payment")
+        dscr_am = lm.get("dscr_amortising")
+        dscr_io = lm.get("dscr_interest_only")
+        risk_cat = lm.get("risk_category", "N/A")
+        risk_score = lm.get("risk_score_computed", "N/A")
+        reasons = lm.get("risk_reasons", [])
+        summary_lines = []
 
-# KPIs and summary box
-st.markdown('<div class="report-box">', unsafe_allow_html=True)
-try:
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        if lm.get("ltv") is not None:
-            st.metric("LTV", f"{lm.get('ltv')*100:.1f}%")
+        # Build HTML
+        html = ['<div class="resume">']
+        html.append(f'<div style="display:flex; justify-content:space-between; align-items:baseline;"><div><h2 style="margin:0">{borrower}</h2><div class="small">Underwriting report</div></div><div style="text-align:right"><strong>{risk_cat}</strong><div class="small">Score: {risk_score}</div></div></div>')
+        html.append('<hr />')
+
+        # Contact & Key Facts
+        html.append('<div class="section-title">Key facts</div>')
+        html.append('<div class="kv"><div class="k">Loan amount</div><div class="v">£{:,}</div></div>'.format(int(loan_amount) if isinstance(loan_amount, (int, float)) else loan_amount))
+        html.append('<div class="kv"><div class="k">Project / Total cost</div><div class="v">£{:,}</div></div>'.format(int(project_cost) if isinstance(project_cost, (int, float)) else project_cost))
+        html.append('<div class="kv"><div class="k">Interest rate (annual)</div><div class="v">{}</div></div>'.format(f"{rate}%" if isinstance(rate, (int, float)) and rate>1 else f"{rate}" if rate!="N/A" else rate))
+        html.append('<div class="kv"><div class="k">Loan term</div><div class="v">{}</div></div>'.format(f"{term} months"))
+        html.append('<div class="kv"><div class="k">Property value</div><div class="v">£{:,}</div></div>'.format(int(property_value) if isinstance(property_value, (int, float)) else property_value))
+        html.append('<div class="kv"><div class="k">LTV</div><div class="v">{}</div></div>'.format(ltv_str))
+
+        # Financials
+        html.append('<div class="section-title">Financials & Affordability</div>')
+        html.append('<div class="kv"><div class="k">Annual income</div><div class="v">£{:,}</div></div>'.format(int(income) if isinstance(income,(int,float)) else income))
+        if monthly_am is not None:
+            html.append('<div class="kv"><div class="k">Monthly (Amortising)</div><div class="v">£{:,}</div></div>'.format(int(monthly_am)))
+        if monthly_io is not None:
+            html.append('<div class="kv"><div class="k">Monthly (Interest-only)</div><div class="v">£{:,}</div></div>'.format(int(monthly_io)))
+        html.append('<div class="kv"><div class="k">NOI</div><div class="v">£{:,}</div></div>'.format(int(lm.get("noi")) if lm.get("noi") is not None else "N/A"))
+
+        # Metrics & Ratios
+        html.append('<div class="section-title">Metrics</div>')
+        html.append('<div class="kv"><div class="k">DSCR (Amortising)</div><div class="v">{}</div></div>'.format(f"{dscr_am:.2f}" if isinstance(dscr_am,(int,float)) else "N/A"))
+        html.append('<div class="kv"><div class="k">DSCR (Interest-only)</div><div class="v">{}</div></div>'.format(f"{dscr_io:.2f}" if isinstance(dscr_io,(int,float)) else "N/A"))
+        html.append('<div class="kv"><div class="k">Total interest (est.)</div><div class="v">£{:,}</div></div>'.format(int(lm.get("total_interest")) if lm.get("total_interest") is not None else "N/A"))
+
+        # Risk & Reasons
+        html.append('<div class="section-title">Risk assessment</div>')
+        if reasons:
+            html.append('<ul>')
+            for r in reasons:
+                html.append(f'<li class="bullet">{r}</li>')
+            html.append('</ul>')
         else:
-            st.metric("LTV", "N/A")
-    with c2:
-        st.metric("Monthly (Amortising)", f"£{lm.get('monthly_amortising_payment'):,}" if lm.get("monthly_amortising_payment") else "N/A")
-    with c3:
-        st.metric("Monthly (Interest-only)", f"£{lm.get('monthly_interest_only_payment'):,}" if lm.get("monthly_interest_only_payment") else "N/A")
-except Exception:
-    pass
+            html.append('<div class="kv"><div class="v">No automated flags detected.</div></div>')
 
-st.markdown("### Summary")
-if lm.get("ltv") is not None:
-    st.write(f"LTV: {lm.get('ltv')*100:.2f}%")
-else:
-    st.write("LTV: N/A")
-if lm.get("monthly_amortising_payment") is not None:
-    st.write(f"Monthly amortising payment: £{lm.get('monthly_amortising_payment'):,}")
-if lm.get("monthly_interest_only_payment") is not None:
-    st.write(f"Monthly interest-only payment: £{lm.get('monthly_interest_only_payment'):,}")
-if lm.get("noi") is not None:
-    st.write(f"NOI: £{lm.get('noi'):,} (estimated: {bool(lm.get('noi_estimated_from_income_proxy', False))})")
-st.write(f"Risk category: {lm.get('risk_category')} (score {lm.get('risk_score_computed')})")
-st.write("Reasons: " + "; ".join(lm.get("risk_reasons", [])))
+        # Amortization preview table (if present)
+        if lm.get("amortization_preview_rows"):
+            html.append('<div class="section-title">Amortization (first 12 months)</div>')
+            rows = lm["amortization_preview_rows"]
+            # build small HTML table
+            html.append('<table style="width:100%; border-collapse:collapse;">')
+            html.append('<tr style="background:#f4f8fb;"><th style="text-align:left;padding:6px">Month</th><th style="text-align:right;padding:6px">Payment</th><th style="text-align:right;padding:6px">Interest</th><th style="text-align:right;padding:6px">Principal</th><th style="text-align:right;padding:6px">Balance</th></tr>')
+            for r in rows:
+                html.append(f'<tr><td style="padding:6px">{r.get("month")}</td><td style="padding:6px;text-align:right">£{r.get("payment"):,}</td><td style="padding:6px;text-align:right">£{r.get("interest"):,}</td><td style="padding:6px;text-align:right">£{r.get("principal"):,}</td><td style="padding:6px;text-align:right">£{r.get("balance"):,}</td></tr>')
+            html.append('</table>')
 
-# Amortization preview chart if available
-if lm.get("amortization_preview_rows"):
+        # Footer / notes
+        html.append('<div style="margin-top:12px;" class="small">Audit notes: {}</div>'.format(", ".join(audit) if isinstance(audit, list) else str(audit)))
+        html.append('</div>')  # end resume
+        return "\n".join(html)
+
+    report_html = render_resume_report(parsed, lm)
+    # Render the report (not code/monsospace)
+    st.markdown(report_html, unsafe_allow_html=True)
+
+    # Download JSON report
     try:
-        df_am = pd.DataFrame(lm["amortization_preview_rows"])
-        base = alt.Chart(df_am).encode(x=alt.X("month:Q", title="Month"))
-        balance_line = base.mark_line(color="#1f77b4").encode(y=alt.Y("balance:Q", title="Remaining balance (£)"))
-        center_chart(balance_line, height=260)
+        payload = {"parsed": parsed, "lending_metrics": lm}
+        b = io.BytesIO()
+        b.write(json.dumps(payload, indent=2).encode("utf-8"))
+        b.seek(0)
+        st.download_button("Download report (JSON)", data=b, file_name="underwriting_report.json", mime="application/json")
     except Exception:
         pass
 
-st.markdown('</div>', unsafe_allow_html=True)
+    # Optional LLM summary area
+    with st.expander("AI Summary"):
+        try:
+            summ = generate_summary(parsed)
+        except Exception:
+            summ = generate_summary(parsed)
+        st.write(summ)
 
-# Q&A deterministic responses
+# If user didn't press Analyse yet, still show a compact preview of key metrics when available
+if st.session_state.get("last_analysis") and not st.session_state.get("qa_answer"):
+    preview = st.session_state["last_analysis"].get("lending_metrics") if isinstance(st.session_state["last_analysis"], dict) else None
+    if preview:
+        st.markdown("<div style='max-width:980px;margin:auto;'>", unsafe_allow_html=True)
+        st.markdown("#### Last computed metrics (preview)")
+        st.json(preview)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# Q&A (deterministic fallback)
 st.markdown("---")
 st.subheader("Ask a question about this application")
 st.text_input("Question", key="qa_question")
 if st.button("Ask"):
-    question = st.session_state.get("qa_question", "").strip().lower()
-    if not question:
+    q = st.session_state.get("qa_question", "").strip()
+    if not q:
         st.warning("Please enter a question.")
     else:
-        if not parsed:
-            st.error("No parsed data available. Run Analyse.")
+        parsed_last = st.session_state.get("last_analysis") or parsed
+        lm_last = parsed_last.get("lending_metrics") if isinstance(parsed_last, dict) else {}
+        # simple deterministic answers
+        ql = q.lower()
+        if "why" in ql and ("flag" in ql or "risk" in ql):
+            ans = "Reasons: " + "; ".join(lm_last.get("risk_reasons", []))
+        elif "summary" in ql or "financial position" in ql:
+            try:
+                ans = generate_summary(parsed_last)
+            except Exception:
+                ans = "Summary not available."
         else:
-            answer = None
-            if ("why" in question and ("flag" in question or "risk" in question)):
-                answer = "Reasons: " + "; ".join(lm.get("risk_reasons", []))
-            elif ("bridge" in question or "bridg" in question) and ("suit" in question or "suitable" in question):
-                term_ok = parsed.get("loan_term_months") is not None and parsed.get("loan_term_months") <= 24
-                ltv_ok = lm.get("ltv") is not None and lm.get("ltv") <= 0.75
-                dscr_ok = lm.get("dscr_interest_only") is None or lm.get("dscr_interest_only") >= 1.0
-                ok = term_ok and ltv_ok and dscr_ok
-                reasons = []
-                if not term_ok:
-                    reasons.append(f"term months = {parsed.get('loan_term_months')}")
-                if not ltv_ok:
-                    reasons.append(f"ltv = {lm.get('ltv')}")
-                if not dscr_ok:
-                    reasons.append(f"interest-only dscr = {lm.get('dscr_interest_only')}")
-                answer = "Suitable for typical bridging: " + ("Yes" if ok else "No") + ("" if ok else f". Issues: {', '.join(reasons)}")
-            else:
-                answer = "No LLM configured — deterministic responses only. Configure LLM for richer answers."
-            st.session_state["qa_answer"] = answer
-
+            try:
+                ans = answer_question(parsed_last, q)
+            except Exception:
+                ans = "LLM not available; deterministic response not found."
+        st.session_state["qa_answer"] = ans
 if st.session_state.get("qa_answer"):
     st.markdown("**Answer:**")
     st.write(st.session_state.get("qa_answer"))

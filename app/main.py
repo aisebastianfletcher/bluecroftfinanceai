@@ -1,10 +1,20 @@
-# app/main.py
-# Bluecroft Finance — Streamlit app (full main.py)
-# - Uses app.metrics.compute_lending_metrics for robust lending calculations
-# - Uses app.parse_helpers.extract_embedded_kv to extract machine fields embedded inside text
-# - Prompts user to fix implausible loan amounts and missing required fields
-# - Stores manual parsed payload as JSON string in session_state to avoid StreamlitAPIException
-# - Stacked single-column report layout and centered charts (via center_chart helper)
+"""
+Bluecroft Finance — Streamlit app entrypoint (app/main.py)
+
+This main.py is a single-file, robust Streamlit UI for:
+- selecting a source (uploaded PDF, generated PDF, quick calculator, manual parsed JSON)
+- extracting embedded machine-readable fields from text blocks when necessary
+- normalising numeric fields (commas, currency symbols, percent handling)
+- prompting the user to supply or fix implausible/missing critical inputs
+- computing lending metrics with app.metrics (if present)
+- generating a parser-friendly PDF using app.pdf_form (if present)
+- safe session_state usage (store only JSON-serializable values)
+
+Notes:
+- The file defensively imports app.parse_helpers and app.metrics. If either is missing the app still runs with reduced functionality.
+- Place this file at app/main.py in your repository (overwrite if present).
+"""
+from __future__ import annotations
 import os
 import sys
 import io
@@ -18,33 +28,51 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 
-# ensure repo root importable
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# robust metrics and parse helpers (make sure these files exist: app/metrics.py, app/parse_helpers.py)
-from app.metrics import compute_lending_metrics, amortization_schedule  # type: ignore
-from app.parse_helpers import extract_embedded_kv, detect_implausible_loan  # type: ignore
+# Try to import app.metrics (robust metrics). Fallback to a minimal local implementation if missing.
+try:
+    from app.metrics import compute_lending_metrics, amortization_schedule  # type: ignore
+except Exception:
+    compute_lending_metrics = None
+    amortization_schedule = None
+
+# Try to import parse helpers. Provide no-op fallbacks if missing so app won't crash.
+try:
+    from app.parse_helpers import extract_embedded_kv, detect_implausible_loan  # type: ignore
+except Exception:
+    def extract_embedded_kv(parsed: dict) -> tuple[dict, list]:
+        return parsed or {}, []
+    def detect_implausible_loan(parsed: dict) -> bool:
+        return False
+
+# Try to import PDF generator helper (optional)
+try:
+    from app.pdf_form import create_pdf_from_dict  # type: ignore
+except Exception:
+    create_pdf_from_dict = None
 
 st.set_page_config(page_title="Bluecroft Finance — AI Lending Assistant", layout="wide")
 
-# Output dirs
+# Ensure output folders exist
 os.makedirs(ROOT / "output" / "generated_pdfs", exist_ok=True)
+os.makedirs(ROOT / "output" / "uploaded_pdfs", exist_ok=True)
 os.makedirs(ROOT / "output" / "supporting_docs", exist_ok=True)
 
-# small CSS to keep charts centered
+# Simple CSS for neatness
 st.markdown(
     """
     <style>
-    .report-box { max-width:980px; margin-left:auto; margin-right:auto; background:rgba(255,255,255,0.98); padding:18px; border-radius:10px; }
-    .stAltairChart, .stVegaLiteChart, .vega-embed { display:block !important; margin-left:auto !important; margin-right:auto !important; width:100% !important; }
+    .report-box { max-width:980px; margin-left:auto; margin-right:auto; background:rgba(255,255,255,0.98);
+      padding:18px; border-radius:10px; box-shadow:0 8px 24px rgba(10,30,60,0.08); }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# helper to center altair charts using three-column trick
+# helpers
 def center_chart(chart_obj, use_container_width: bool = True, height: int | None = None):
     try:
         cols = st.columns([1, 10, 1])
@@ -57,139 +85,21 @@ def center_chart(chart_obj, use_container_width: bool = True, height: int | None
     except Exception:
         st.altair_chart(chart_obj, use_container_width=use_container_width)
 
-# initialize session_state keys (only simple types or JSON strings)
-if "generated_pdf" not in st.session_state:
-    st.session_state["generated_pdf"] = None
-if "uploaded_pdf" not in st.session_state:
-    st.session_state["uploaded_pdf"] = None
-if "calc_result" not in st.session_state:
-    st.session_state["calc_result"] = None
-if "last_analysis" not in st.session_state:
-    st.session_state["last_analysis"] = None
-if "qa_question" not in st.session_state:
-    st.session_state["qa_question"] = ""
-if "qa_answer" not in st.session_state:
-    st.session_state["qa_answer"] = None
-# manual parsed will be stored as JSON string to avoid Streamlit session issues
-if "manual_parsed_json" not in st.session_state:
-    st.session_state["manual_parsed_json"] = None
-# supporting docs mapping group -> list(paths)
-if "supporting_groups" not in st.session_state:
-    st.session_state["supporting_groups"] = {}
-
-# Page header
-st.markdown("<h2>Bluecroft Finance — AI Lending Assistant</h2>", unsafe_allow_html=True)
-st.markdown("Fill the form, upload a PDF, or use the quick calculator. Then click 'Analyse With AI'.")
-
-# Left: Inputs / Forms
-with st.expander("Quick Calculator (create sample parsed data)"):
-    with st.form("calc"):
-        c_borrower = st.text_input("Borrower name", "John Doe")
-        c_income = st.number_input("Annual income (GBP)", value=85000, step=1000)
-        c_loan = st.number_input("Loan amount (GBP)", value=200000, step=1000)
-        c_property = st.number_input("Property value (GBP)", value=300000, step=1000)
-        c_rate = st.number_input("Interest rate (annual %)", value=9.5, step=0.1)
-        c_term_years = st.number_input("Term (years)", value=1, min_value=1, step=1)
-        calc_submit = st.form_submit_button("Create sample parsed")
-    if calc_submit:
-        parsed = {
-            "borrower": c_borrower,
-            "income": float(c_income),
-            "loan_amount": float(c_loan),
-            "property_value": float(c_property),
-            # The parser expects interest_rate_annual possibly as percent (9.5) — metrics handles >1 -> /100
-            "interest_rate_annual": float(c_rate),
-            "loan_term_months": int(c_term_years) * 12,
-            "term_months": int(c_term_years) * 12,  # compatibility
-        }
-        st.session_state["calc_result"] = parsed
-        st.success("Sample parsed stored; choose 'Use quick calculator result' in Selection and click Analyse.")
-
-with st.expander("Manual parsed JSON"):
-    st.markdown("Paste a raw parsed dict / JSON output from your pipeline. The app will try to extract machine fields embedded inside strings.")
-    manual_text = st.text_area("Raw parsed JSON (or Python repr)", height=140)
-    if st.button("Save manual parsed"):
-        # attempt to parse JSON; if fails, store as raw string inside a JSON wrapper to allow extract_embedded_kv to work
-        manual_obj = None
+def save_supporting_files(files: typing.Iterable[typing.Any], group_name: str) -> list:
+    out_dir = ROOT / "output" / "supporting_docs" / group_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for f in files:
         try:
-            manual_obj = json.loads(manual_text)
+            filename = Path(f.name).name
+            dest = out_dir / filename
+            with open(dest, "wb") as fh:
+                fh.write(f.getbuffer())
+            saved.append(str(dest))
         except Exception:
-            # fall back to putting the raw string into a field 'raw_text'
-            manual_obj = {"raw_text": manual_text}
-        # serialize to JSON string for safe session storage
-        st.session_state["manual_parsed_json"] = json.dumps(manual_obj)
-        st.success("Manual parsed JSON saved (to be used as analysis source).")
+            continue
+    return saved
 
-# Upload PDF (basic)
-with st.expander("Upload PDF (optional)"):
-    uploaded_file = st.file_uploader("Upload application PDF (optional)", type=["pdf"])
-    if uploaded_file is not None:
-        dest_dir = ROOT / "output" / "uploaded_pdfs"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        fname = f"{int(time.time())}_{Path(uploaded_file.name).name}"
-        dest = dest_dir / fname
-        with open(dest, "wb") as fh:
-            fh.write(uploaded_file.getbuffer())
-        st.session_state["uploaded_pdf"] = str(dest)
-        st.success(f"Uploaded PDF saved to {dest}")
-
-st.markdown("---")
-
-# Selection: choose data source to analyse
-sources = []
-if st.session_state.get("uploaded_pdf"):
-    sources.append("Uploaded PDF")
-if st.session_state.get("generated_pdf"):
-    sources.append("Most recent generated PDF")
-if st.session_state.get("calc_result"):
-    sources.append("Use quick calculator result")
-if st.session_state.get("manual_parsed_json"):
-    sources.append("Use manual parsed values")
-if not sources:
-    sources = ["Manual entry (no preloaded data)"]
-
-choice = st.selectbox("Choose source to inspect / analyse", options=sources, index=0)
-
-# Prepare parsed dict from selected source
-parsed: dict = {}
-if choice == "Use quick calculator result":
-    parsed = dict(st.session_state.get("calc_result") or {})
-elif choice == "Use manual parsed values":
-    try:
-        parsed = json.loads(st.session_state.get("manual_parsed_json") or "{}")
-    except Exception:
-        parsed = {"raw_text": st.session_state.get("manual_parsed_json")}
-elif choice == "Uploaded PDF":
-    # NOTE: pipeline extraction is repository-specific. Try to call pipeline if present.
-    pdf_path = st.session_state.get("uploaded_pdf")
-    parsed = {}
-    try:
-        try:
-            from pipeline.pipeline import process_pdf  # type: ignore
-            parsed = process_pdf(pdf_path) or {}
-        except Exception:
-            # pipeline not installed or failed; leave parsed empty for manual input
-            parsed = {}
-            st.warning("No pipeline available to extract PDF — use Manual parsed values or Quick Calculator.")
-    except Exception as e:
-        st.error("Error while trying to process uploaded PDF: " + str(e))
-        parsed = {}
-else:
-    # Manual entry fallback (user can edit raw parsed above and Save)
-    parsed = {}
-
-# Display raw parsed for debugging
-st.markdown("### Raw parsed (diagnostic)")
-st.write(parsed)
-
-# --- INSERTION POINT: extract embedded machine fields and suggest fixes ---
-# Use parse_helpers to extract key:value pairs that may be embedded inside string fields
-parsed, extracted = extract_embedded_kv(parsed)
-if extracted:
-    st.info(f"Extracted machine fields from text: {', '.join(extracted)}")
-    st.write("Parsed after extraction:", parsed)
-
-# Normalize a few common fields (strip currency formatting) - keep minimal so canonicaliser in metrics can work well
 def _norm_quiet(v):
     if v is None:
         return None
@@ -198,8 +108,7 @@ def _norm_quiet(v):
     s = str(v).strip()
     if s == "":
         return None
-    s = s.replace(",", "").replace("£", "").replace("$", "")
-    # try numeric
+    s = s.replace(",", "").replace("£", "").replace("$", "").strip()
     try:
         if "." in s:
             return float(s)
@@ -207,80 +116,249 @@ def _norm_quiet(v):
     except Exception:
         return s
 
-# apply normalisation gently to keys we care about
+# Session defaults (store only simple JSON-serializable types)
+for k, v in [
+    ("generated_pdf", None),
+    ("uploaded_pdf", None),
+    ("calc_result", None),
+    ("last_analysis", None),
+    ("manual_parsed_json", None),
+    ("supporting_groups", {}),
+    ("qa_question", ""),
+    ("qa_answer", None),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# HEADER
+st.markdown("<h2>Bluecroft Finance — AI Lending Assistant</h2>", unsafe_allow_html=True)
+st.markdown("Use the Quick Calculator, paste raw parsed JSON, or upload a PDF. Click 'Analyse With AI' to compute lending metrics.")
+
+# Input area: Quick Calculator / Manual Parsed / Upload / Generate PDF
+with st.expander("Quick Calculator (create parsed sample)"):
+    with st.form("quick_calc"):
+        qc1, qc2 = st.columns(2)
+        with qc1:
+            q_borrower = st.text_input("Borrower", "John Doe")
+            q_income = st.number_input("Annual income (GBP)", value=85000, step=1000)
+            q_loan = st.number_input("Loan amount (GBP)", value=200000, step=1000)
+        with qc2:
+            q_prop = st.number_input("Property value (GBP)", value=300000, step=1000)
+            q_rate = st.number_input("Interest rate (annual %)", value=9.5, step=0.1)
+            q_term_years = st.number_input("Term (years)", value=1, min_value=1, step=1)
+        submit_q = st.form_submit_button("Save sample parsed")
+    if submit_q:
+        parsed = {
+            "borrower": q_borrower,
+            "income": float(q_income),
+            "loan_amount": float(q_loan),
+            "property_value": float(q_prop),
+            "interest_rate_annual": float(q_rate),
+            "loan_term_months": int(q_term_years) * 12,
+            "term_months": int(q_term_years) * 12,
+        }
+        st.session_state["calc_result"] = parsed
+        st.success("Sample parsed saved to session (Use 'Use quick calculator result' in Selection).")
+
+with st.expander("Manual parsed JSON (paste pipeline output)"):
+    st.markdown("Paste raw parsed JSON or a Python repr. The app will try to extract machine-readable key:value pairs embedded inside strings.")
+    manual_text = st.text_area("Raw parsed JSON / text", height=140)
+    if st.button("Save manual parsed"):
+        try:
+            manual_obj = json.loads(manual_text)
+        except Exception:
+            manual_obj = {"raw_text": manual_text}
+        st.session_state["manual_parsed_json"] = json.dumps(manual_obj)
+        st.success("Manual parsed saved.")
+
+with st.expander("Upload / Generate PDF"):
+    col_a, col_b = st.columns(2)
+    with col_a:
+        uploaded = st.file_uploader("Upload application PDF", type=["pdf"])
+        if uploaded:
+            dest_dir = ROOT / "output" / "uploaded_pdfs"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / f"{int(time.time())}_{Path(uploaded.name).name}"
+            with open(dest, "wb") as fh:
+                fh.write(uploaded.getbuffer())
+            st.session_state["uploaded_pdf"] = str(dest)
+            st.success(f"Uploaded and saved: {dest}")
+    with col_b:
+        # Allow generating a machine-block PDF if create_pdf_from_dict exists
+        if create_pdf_from_dict:
+            with st.form("gen_pdf_form"):
+                g_borrower = st.text_input("Borrower (for generated PDF)", "John Doe")
+                g_income = st.text_input("Income", "85000")
+                g_loan = st.text_input("Loan amount", "200000")
+                g_property = st.text_input("Property value", "300000")
+                g_project_cost = st.text_input("project_cost", "260000")
+                g_total_cost = st.text_input("total_cost", "260000")
+                g_rate = st.text_input("interest_rate_annual", "9.5")
+                g_term = st.text_input("loan_term_months", "12")
+                gen_submit = st.form_submit_button("Generate parser-friendly PDF")
+            if gen_submit:
+                # build dict with exact machine keys
+                data = {
+                    "borrower": g_borrower,
+                    "income": _norm_quiet(g_income),
+                    "loan_amount": _norm_quiet(g_loan),
+                    "property_value": _norm_quiet(g_property),
+                    "project_cost": _norm_quiet(g_project_cost),
+                    "total_cost": _norm_quiet(g_total_cost),
+                    "interest_rate_annual": _norm_quiet(g_rate),
+                    "loan_term_months": _norm_quiet(g_term),
+                    "term_months": _norm_quiet(g_term),
+                }
+                try:
+                    path = create_pdf_from_dict(data)
+                    st.session_state["generated_pdf"] = path
+                    st.success(f"PDF created: {path}")
+                    with open(path, "rb") as fh:
+                        st.download_button("Download generated PDF", data=fh.read(), file_name=Path(path).name, mime="application/pdf")
+                except Exception as e:
+                    st.error("PDF generation failed: " + str(e))
+
+st.markdown("---")
+
+# Selection of source
+options = []
+if st.session_state.get("uploaded_pdf"):
+    options.append("Uploaded PDF")
+if st.session_state.get("generated_pdf"):
+    options.append("Most recent generated PDF")
+if st.session_state.get("calc_result"):
+    options.append("Use quick calculator result")
+if st.session_state.get("manual_parsed_json"):
+    options.append("Use manual parsed values")
+if not options:
+    options = ["Manual entry (no preloaded data)"]
+
+choice = st.selectbox("Choose source to analyse", options=options, index=0)
+
+# Build parsed dict from selection
+parsed: dict = {}
+if choice == "Uploaded PDF":
+    pdf_path = st.session_state.get("uploaded_pdf")
+    parsed = {}
+    # attempt to call pipeline if available (non-fatal)
+    try:
+        from pipeline.pipeline import process_pdf  # type: ignore
+        parsed = process_pdf(pdf_path) or {}
+    except Exception:
+        # pipeline not present — leave parsed empty so user can paste manual
+        parsed = {}
+        st.info("No pipeline available to auto-extract from PDF; use manual entry or quick calculator.")
+elif choice == "Most recent generated PDF":
+    gen = st.session_state.get("generated_pdf")
+    if gen:
+        try:
+            from pipeline.pipeline import process_pdf  # type: ignore
+            parsed = process_pdf(gen) or {}
+        except Exception:
+            parsed = {}
+            st.info("Pipeline not available to extract generated PDF.")
+elif choice == "Use quick calculator result":
+    parsed = dict(st.session_state.get("calc_result") or {})
+elif choice == "Use manual parsed values":
+    try:
+        parsed = json.loads(st.session_state.get("manual_parsed_json") or "{}")
+    except Exception:
+        parsed = {"raw_text": st.session_state.get("manual_parsed_json")}
+else:
+    parsed = {}
+
+# Debug: show raw parsed
+st.markdown("### Raw parsed (diagnostic)")
+st.write(parsed)
+
+# --- Extract embedded key:value pairs embedded inside strings ---
+parsed, extracted = extract_embedded_kv(parsed)
+if extracted:
+    st.info(f"Extracted machine fields from text: {', '.join(extracted)}")
+    st.write("Parsed after extraction:", parsed)
+
+# Gentle normalisation of key numeric fields so downstream metrics can find them
 for k in ("loan_amount", "property_value", "project_cost", "total_cost", "interest_rate_annual", "loan_term_months", "term_months", "income"):
-    if k in parsed:
+    if k in parsed and parsed.get(k) is not None:
         parsed[k] = _norm_quiet(parsed.get(k))
 
-# Show normalised parsed
 st.markdown("### Normalised parsed (diagnostic)")
 st.write(parsed)
 
-# If embedded extraction didn't pick up required fields, show audit and supply-missing form later (metrics will also audit)
-# Detect implausible loan and prompt quick fix before computing metrics
+# If small/implausible loan, prompt quick fix
 if detect_implausible_loan(parsed):
-    st.warning("Detected implausible loan amount (very small vs property / project). Please confirm or fix the loan amount.")
+    st.warning("Detected implausible/suspicious loan amount relative to property/project. Please confirm or fix.")
     with st.form("fix_loan_amount"):
-        suggested1 = parsed.get("project_cost")
-        suggested2 = parsed.get("total_cost") or parsed.get("project_cost")
-        options = ["Enter manually"]
-        if suggested1:
-            options.append(f"Set loan_amount = project_cost ({suggested1})")
-        if suggested2:
-            options.append(f"Set loan_amount = total_cost ({suggested2})")
-        opt = st.radio("Fix option", options)
+        s1 = parsed.get("project_cost")
+        s2 = parsed.get("total_cost") or s1
+        opts = ["Enter manually"]
+        if s1:
+            opts.append(f"Set loan_amount = project_cost ({s1})")
+        if s2:
+            opts.append(f"Set loan_amount = total_cost ({s2})")
+        choice_fix = st.radio("Fix option", opts)
         manual_val = st.number_input("Manual loan amount (GBP)", value=0.0, step=100.0, format="%.2f")
-        apply_fix = st.form_submit_button("Apply fix")
-    if apply_fix:
-        if opt.startswith("Set loan_amount = project_cost") and suggested1:
-            parsed["loan_amount"] = suggested1
-            st.success(f"Applied: loan_amount = {suggested1}")
-        elif opt.startswith("Set loan_amount = total_cost") and suggested2:
-            parsed["loan_amount"] = suggested2
-            st.success(f"Applied: loan_amount = {suggested2}")
+        applied = st.form_submit_button("Apply fix")
+    if applied:
+        if choice_fix.startswith("Set loan_amount = project_cost") and s1:
+            parsed["loan_amount"] = s1
+            st.success(f"Applied: loan_amount = {s1}")
+        elif choice_fix.startswith("Set loan_amount = total_cost") and s2:
+            parsed["loan_amount"] = s2
+            st.success(f"Applied: loan_amount = {s2}")
         elif manual_val and manual_val > 0:
             parsed["loan_amount"] = manual_val
             st.success(f"Applied manual loan_amount = {manual_val}")
         else:
-            st.warning("No valid fix applied. Please enter a manual value > 0.")
+            st.warning("No valid fix applied. Please enter a manual positive value.")
 
-# Compute metrics (this will attach input_audit and lending_metrics into parsed)
+# Compute lending metrics (use robust module if available, otherwise show helpful message)
+if compute_lending_metrics:
+    try:
+        lm = compute_lending_metrics(parsed)
+    except Exception as e:
+        st.error("Metrics computation failed: " + str(e))
+        lm = parsed.get("lending_metrics") or {}
+else:
+    st.warning("Metrics module not installed (app/metrics.py missing). Computation skipped.")
+    lm = parsed.get("lending_metrics") or {}
+
+# Persist last analysis safely (make sure to store JSON-serializable structures)
 try:
-    metrics = compute_lending_metrics(parsed)
-except Exception as e:
-    st.error("Metrics computation failed: " + str(e))
-    metrics = parsed.get("lending_metrics", {})
+    st.session_state["last_analysis"] = parsed
+except Exception:
+    # If parsed contains non-serializable things, store as JSON string
+    try:
+        st.session_state["last_analysis"] = json.loads(json.dumps(parsed, default=str))
+    except Exception:
+        st.session_state["last_analysis"] = {}
 
-# Persist last analysis (store only primitives / JSON-friendly dict)
-st.session_state["last_analysis"] = parsed
-
-# Show input audit from metrics (if any)
-audit = parsed.get("input_audit") or parsed.get("input_audit", []) or parsed.get("input_audit", [])
-# The metrics implementation may also put notes into parsed["input_audit"] or parsed["lending_metrics"]["input_audit_notes"]
+# Show input audit from parsed (metrics attaches parsed['input_audit'])
+audit = parsed.get("input_audit") or []
 if isinstance(audit, list) and audit:
     st.warning("Input audit: " + "; ".join(audit))
-# also check lending_metrics.input_audit_notes
-lm = parsed.get("lending_metrics") or {}
-note_list = lm.get("input_audit_notes") or []
-if note_list:
-    st.info("Normalization notes: " + "; ".join(note_list))
+
+# Show notes from metrics if present
+notes = lm.get("input_audit_notes") if isinstance(lm, dict) else None
+if notes:
+    st.info("Normalization notes: " + "; ".join(notes))
 
 # Display computed metrics
 st.subheader("Computed lending metrics")
 st.json(lm)
 
-# Human-friendly summary and KPIs
+# KPIs and summary
 st.markdown('<div class="report-box">', unsafe_allow_html=True)
 try:
-    k1, k2, k3 = st.columns([1, 1, 1])
-    with k1:
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
         if lm.get("ltv") is not None:
             st.metric("LTV", f"{lm.get('ltv')*100:.1f}%")
         else:
             st.metric("LTV", "N/A")
-    with k2:
+    with c2:
         st.metric("Monthly (Amortising)", f"£{lm.get('monthly_amortising_payment'):,}" if lm.get("monthly_amortising_payment") else "N/A")
-    with k3:
+    with c3:
         st.metric("Monthly (Interest-only)", f"£{lm.get('monthly_interest_only_payment'):,}" if lm.get("monthly_interest_only_payment") else "N/A")
 except Exception:
     pass
@@ -290,48 +368,58 @@ if lm.get("ltv") is not None:
     st.write(f"LTV: {lm.get('ltv')*100:.2f}%")
 else:
     st.write("LTV: N/A")
-if lm.get("monthly_interest_only_payment") is not None:
-    st.write(f"Monthly interest-only payment: £{lm.get('monthly_interest_only_payment'):,}")
 if lm.get("monthly_amortising_payment") is not None:
     st.write(f"Monthly amortising payment: £{lm.get('monthly_amortising_payment'):,}")
+if lm.get("monthly_interest_only_payment") is not None:
+    st.write(f"Monthly interest-only payment: £{lm.get('monthly_interest_only_payment'):,}")
 if lm.get("noi") is not None:
     st.write(f"NOI: £{lm.get('noi'):,} (estimated: {bool(lm.get('noi_estimated_from_income_proxy', False))})")
 st.write(f"Risk category: {lm.get('risk_category')} (score {lm.get('risk_score_computed')})")
 st.write("Reasons: " + "; ".join(lm.get("risk_reasons", [])))
 
-# Small amortization chart if available
+# Small amortization preview chart (if available)
 if lm.get("amortization_preview_rows"):
     try:
         df_am = pd.DataFrame(lm["amortization_preview_rows"])
         base = alt.Chart(df_am).encode(x=alt.X("month:Q", title="Month"))
         balance_line = base.mark_line(color="#1f77b4").encode(y=alt.Y("balance:Q", title="Remaining balance (£)"))
-        center_chart((balance_line), height=260)
+        center_chart(balance_line, height=260)
     except Exception:
         pass
 
 st.markdown('</div>', unsafe_allow_html=True)
 
-# Q&A simple deterministic questions
+# Simple Q&A deterministic responses
 st.markdown("---")
 st.subheader("Ask a question about this application")
 st.text_input("Question", key="qa_question")
 if st.button("Ask"):
-    q = st.session_state.get("qa_question", "").strip().lower()
-    if not q:
-        st.warning("Enter a question.")
+    question = st.session_state.get("qa_question", "").strip().lower()
+    if not question:
+        st.warning("Please enter a question.")
     else:
         if not parsed:
-            st.error("No parsed data available. Run Analyse first.")
+            st.error("No parsed data available. Run Analyse.")
         else:
-            ans = None
-            if "why" in q and ("flag" in q or "risk" in q):
-                ans = "Reasons: " + "; ".join(lm.get("risk_reasons", []))
-            elif "bridge" in q:
-                dscr_io = lm.get("dscr_interest_only")
-                ans = f"Interest-only DSCR: {dscr_io:.2f}" if dscr_io is not None else "Interest-only DSCR: N/A"
+            answer = None
+            if ("why" in question and ("flag" in question or "risk" in question)):
+                answer = "Reasons: " + "; ".join(lm.get("risk_reasons", []))
+            elif ("bridge" in question or "bridg" in question) and ("suit" in question or "suitable" in question):
+                term_ok = parsed.get("loan_term_months") is not None and parsed.get("loan_term_months") <= 24
+                ltv_ok = lm.get("ltv") is not None and lm.get("ltv") <= 0.75
+                dscr_ok = lm.get("dscr_interest_only") is None or lm.get("dscr_interest_only") >= 1.0
+                ok = term_ok and ltv_ok and dscr_ok
+                reasons = []
+                if not term_ok:
+                    reasons.append(f"term months = {parsed.get('loan_term_months')}")
+                if not ltv_ok:
+                    reasons.append(f"ltv = {lm.get('ltv')}")
+                if not dscr_ok:
+                    reasons.append(f"interest-only dscr = {lm.get('dscr_interest_only')}")
+                answer = "Suitable for typical bridging: " + ("Yes" if ok else "No") + ("" if ok else f". Issues: {', '.join(reasons)}")
             else:
-                ans = "No LLM configured — deterministic answers only. Configure LLM for natural language responses."
-            st.session_state["qa_answer"] = ans
+                answer = "No LLM configured — deterministic responses only. Configure LLM for richer answers."
+            st.session_state["qa_answer"] = answer
 
 if st.session_state.get("qa_answer"):
     st.markdown("**Answer:**")

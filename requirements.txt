@@ -1,4 +1,4 @@
-streamlit>=1.20
+streamlit>=1.22
 pdfplumber>=0.7
 PyMuPDF>=1.23.0
 reportlab>=4.0
@@ -9,3 +9,5 @@ joblib>=1.2
 openai>=0.27.0
 pytesseract>=0.3.10
 Pillow>=9.0.0
+altair
+pyyaml
